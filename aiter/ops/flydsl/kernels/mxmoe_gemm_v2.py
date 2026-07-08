@@ -223,10 +223,13 @@ def gemm_mma(atoms, a_frag, b_frag, c_frag, opsel_a, opsel_b, sa, sb):
 
 # ---- Shared A ds-read + per-J MMA cluster (used by both gemm bodies) ----
 def issue_a_ds_read_dt(
-    s_aq_base, slot, slot_bytes, KH_TILE_A, lane_div_16, lane_mod_16, is_f8, a_vals, a_frags, kMChunks
+    s_aq_base, slot, slot_bytes, KH_TILE_A, lane_div_16, lane_mod_16, is_f8, a_vals, a_frags, kMChunks, k_only=None
 ):
-    """A ds-read for one slot: fp4 -> Vec4 i32 into a_frags; fp8 -> Vec8 i32 into a_vals."""
-    for k in range_constexpr(2):
+    """A ds-read for one slot: fp4 -> Vec4 i32 into a_frags; fp8 -> Vec8 i32 into a_vals.
+    k_only (0/1) restricts the read to a single K-substep so callers can shrink the A live range
+    (k-major mainloop); None reads both substeps (default byte-identical)."""
+    k_range = (k_only,) if k_only is not None else range_constexpr(2)
+    for k in k_range:
         for i in range_constexpr(kMChunks):
             lds_row = lane_mod_16 + i * 16
             row_off = fx.Int32(slot * slot_bytes) + lds_row * KH_TILE_A
@@ -1182,9 +1185,19 @@ def gemm2_body_v2(
         issue_b_load_into(bqf, bsf, kt_rt)
         return bqf, bsf
 
-    def issue_a_ds_read(slot):
+    def issue_a_ds_read(slot, k_only=None):
         issue_a_ds_read_dt(
-            s_aq_base, slot, slot_bytes, KH_TILE_A, lane_div_16, lane_mod_16, is_f8_a, a_vals, a_frags, kMChunks
+            s_aq_base,
+            slot,
+            slot_bytes,
+            KH_TILE_A,
+            lane_div_16,
+            lane_mod_16,
+            is_f8_a,
+            a_vals,
+            a_frags,
+            kMChunks,
+            k_only=k_only,
         )
 
     aq_num_records = fx.Index(i32_max_m_blocks) * fx.Index(fx.Int32(BM) * K_BYTES)
@@ -1261,6 +1274,34 @@ def gemm2_body_v2(
                     j, in_b, sa[sub], sb, bqf, is_f8_a, cbsz_a, a_vals, a_frags, accm, c_frags, mma_atoms, i0=2 * sub
                 )
 
+    # Diff-1 (fp8 only): k-major A/B fragment scoping. The 256-K tile is two 128-K substeps (k=0,1),
+    # and B's `half` index IS that substep. Loading A + B for ONE k, running all four J's MFMAs, then
+    # moving to the next k means only one k-slice of A (kMChunks Vec8 = 32 regs vs 64) and B (4 J frags
+    # = 16 regs vs 32) is live at a time. accm[i][J] sums over k (associative) so the reorder is exact.
+    def stream_b_tile_k(kt_rt, k):
+        bqf_k = [fx.make_fragment_like(frag_tmpl) for _ in range_constexpr(4)]
+        for j in range_constexpr(4):
+            fx.copy(b_catom, bq_views[j][lane_div_16, lane_mod_16, kt_rt, k, None], bqf_k[j])
+        bsf = [fx.make_fragment_like(bs_frag_tmpl) for _ in range_constexpr(2)]
+        for mw in range_constexpr(2):
+            fx.copy(bs_copy_atom, bscale_views[mw][lane_div_16, lane_mod_16, kt_rt, None], bsf[mw])
+        return bqf_k, bsf
+
+    def mfma_cluster_k(bqf_k, bsf, sa, k):
+        # One K-substep: osb = 2*k + in_b; osa in {2*k, 2*k+1} picks the row within the 32-row chunk.
+        for J in range_constexpr(4):
+            mni, in_b = J // 2, J % 2
+            sb = _raw(Vec(bsf[mni].load())[0])
+            bJ = Vec(bqf_k[J].load())
+            osb = 2 * k + in_b
+            for sub in range_constexpr(kSubBlocks):
+                i0 = 2 * sub
+                for di in range_constexpr(2):
+                    i = i0 + di
+                    accm[i][J] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
+                        T.f32x4, [a_vals[i][k], bJ, accm[i][J], cbsz_a, 4, 2 * k + di, sa[sub], osb, sb]
+                    )
+
     # zero C (fp4 fragments accumulate in place; fp8 accm pre-init above).
     if const_expr(not is_f8_a):
         for i in range_constexpr(kMChunks):
@@ -1295,14 +1336,14 @@ def gemm2_body_v2(
     if const_expr(straight_line_k2):
         gpu.barrier()  # A prologue vmem->LDS (both slots) visible before ds-reads
         for kt in range_constexpr(2):
-            issue_a_ds_read(fx.Int32(kt))  # const slot 0/1 (no runtime mod)
             sa = load_a_scale_tile(fx.Int32(kt))
-            # Step 2: process each N-half's B just-in-time so its 4 frags die before the other half loads.
-            for half_n in range_constexpr(2):
-                bqf, bsf = stream_b_half(fx.Int32(kt), half_n)
+            # Diff-1: k-major so only one K-substep's A (32 regs) + B (16 regs) is live at a time.
+            for k in range_constexpr(2):
+                issue_a_ds_read(fx.Int32(kt), k_only=k)  # this substep's A only
+                bqf_k, bsf = stream_b_tile_k(fx.Int32(kt), k)
                 rocdl.sched_barrier(0)
                 rocdl.s_setprio(1)
-                mfma_cluster_half(bqf, bsf, sa, half_n)
+                mfma_cluster_k(bqf_k, bsf, sa, k)
                 rocdl.s_setprio(0)
                 rocdl.sched_barrier(0)
     elif const_expr(g2_kstages == 1):
