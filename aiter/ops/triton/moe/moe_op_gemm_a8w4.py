@@ -413,11 +413,14 @@ def moe_gemm_a8w4(
             "GGUU (is_guinterleave=False) fused swiglu is only wired for the "
             "gluon (gfx1250) matmul path with split_k==1."
         )
-        assert config["block_n"] >= N, (
-            "GGUU (is_guinterleave=False) fused swiglu requires block_n >= N so "
-            f"gate/up halves land in one block (got block_n={config['block_n']}, N={N}); "
-            "use is_guinterleave=True (GUGU) or a block_n covering the full row."
-        )
+        # Force a single full-width N-block so gate[i] and up[i] (contiguous
+        # halves N apart) land in the same tile for the in-block swiglu. No
+        # tuned config carries block_n >= N, so override it here rather than
+        # asserting. OUT_BLOCK_N = block_n // 2 stays a multiple of 32 because
+        # padded_N (= gate|up width) is. Wide tile => bump warps for occupancy.
+        config["block_n"] = triton.next_power_of_2(padded_N)
+        config["split_k"] = 1
+        config["num_warps"] = max(config["num_warps"], 8)
     # allocate output memory. With out_mx_quant=True, the kernel writes fp8 e4m3
     # into y; otherwise the requested out_dtype (bf16).
     if out_mx_quant:
