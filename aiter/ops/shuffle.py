@@ -75,7 +75,11 @@ def shuffle_mxfp8fp4_scale(src: torch.Tensor) -> torch.Tensor:
     return out.view(x_type)
 
 
-def shuffle_weight_gfx1250(w: torch.Tensor) -> torch.Tensor:
+def shuffle_weight_gfx1250(
+    w: torch.Tensor,
+    is_guinterleave: bool = False,
+    gate_up: bool = False,
+) -> torch.Tensor:
     """
     Preshuffle weights for gfx1250 WMMA.
 
@@ -85,15 +89,33 @@ def shuffle_weight_gfx1250(w: torch.Tensor) -> torch.Tensor:
         then apply the same pattern per-expert.
 
     The result is reshaped to (N//16, K*16) for TDM-optimal loading.
+
+    When ``is_guinterleave and gate_up``, the N (output-feature) axis is assumed
+    to hold gate/up as contiguous halves ``[gate | up]``; they are interleaved to
+    ``[g0, u0, g1, u1, ...]`` along N *before* the WMMA tiling, so a fused-swiglu
+    (GUGU) decode kernel sees matched gate/up pairs. This folds in the reorder
+    that callers previously had to do by hand before shuffling. Requires an even
+    N. ``gate_up`` without ``is_guinterleave`` is a no-op (weight already
+    separated); ``is_guinterleave`` without ``gate_up`` is rejected since there is
+    no gate/up split to interleave.
     """
+    if is_guinterleave and not gate_up:
+        raise ValueError("is_guinterleave=True requires gate_up=True")
+
     x_type = w.dtype
     if hasattr(torch, "float4_e2m1fn_x2") and x_type == torch.float4_e2m1fn_x2:
         w = w.view(torch.uint8)
+
+    do_itlv = is_guinterleave and gate_up
 
     if w.ndim == 2:
         N, K = w.shape
         assert N % 16 == 0, f"N={N} must be divisible by 16"
         assert K % 32 == 0, f"K={K} must be divisible by 32"
+        if do_itlv:
+            assert N % 2 == 0, f"gate/up interleave needs even N, got N={N}"
+            # [gate|up] (outer split of N) -> [g0,u0,g1,u1,...]
+            w = w.reshape(2, N // 2, K).permute(1, 0, 2).reshape(N, K)
         w = w.view(N // 16, 16, K // 32, 2, 16)
         w = w.permute(0, 2, 3, 1, 4).contiguous()
         w = w.view(N // 16, K * 16)
@@ -101,6 +123,10 @@ def shuffle_weight_gfx1250(w: torch.Tensor) -> torch.Tensor:
         E, K, N = w.shape
         assert K % 32 == 0, f"K={K} must be divisible by 32"
         assert N % 16 == 0, f"N={N} must be divisible by 16"
+        if do_itlv:
+            assert N % 2 == 0, f"gate/up interleave needs even N, got N={N}"
+            # N is the last (output-feature) axis here: [gate|up] -> interleaved
+            w = w.reshape(E, K, 2, N // 2).permute(0, 1, 3, 2).reshape(E, K, N)
         w = w.transpose(-1, -2)  # (E, N, K)
         w = w.view(E, N // 16, 16, K // 32, 2, 16)
         w = w.permute(0, 1, 3, 4, 2, 5).contiguous()
