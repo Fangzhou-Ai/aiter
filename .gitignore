@@ -92,3 +92,6 @@ aiter/ops/opus/configs/
 # vim swaps
 *.swo
 *.swp
+
+# Local superpowers planning docs (specs/plans) -- kept locally, not tracked
+docs/superpowers/

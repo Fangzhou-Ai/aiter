@@ -280,9 +280,12 @@ def print_gemm1_v2_layout_compare(d, v, token, model_dim, inter_dim, E, topk,
 
 def time_v2_gemm2(d, v, token, model_dim, inter_dim, E, topk, BM_S1, BM_S2, use_nt,
                   epilog, persist, BN, k_wave, base_gemm1_params=None,
-                  print_output=False, use_flydslv2_producer=False):
+                  print_output=False, use_baseline_producer=False):
     stage2_adtype = d.get("stage2_adtype", d.get("adtype", "fp8"))
-    if use_flydslv2_producer:
+    if use_baseline_producer:
+        # Baseline gemm1 (mixed_moe_gemm_2stage) as the intermediate producer.
+        # NOTE: this kernel is incompatible with FLYDSL_DEBUG_ENABLE_DEBUG_INFO=1
+        # (manual cross-statement InsertionPoint -> "Unbalanced InsertionPoint").
         if base_gemm1_params is None:
             raise ValueError("base_gemm1_params is required for FlyDSL v2 layout")
         populate_baseline_v2_intermediate(d, v, token, topk, base_gemm1_params, BM_S1)
@@ -382,6 +385,13 @@ def main():
                    help="print output tensors for the selected stage")
     p.add_argument("--print-baseline-output", action="store_true",
                    help="print the baseline gemm2 output tensor")
+    p.add_argument("--v2-only", action="store_true",
+                   help="only run the v2 kernels (gemm1 producer + gemm2), skipping "
+                        "the baseline flydsl/opus side entirely (baseline column shows nan).")
+    p.add_argument("--baseline-producer", action="store_true",
+                   help="use the baseline gemm1 (mixed_moe_gemm_2stage) to produce the "
+                        "gemm2 intermediate. Default is the v2 gemm1 (mxfp4_moe_gemm1), "
+                        "which is also compatible with FLYDSL_DEBUG_ENABLE_DEBUG_INFO=1.")
     args = p.parse_args()
 
     # gather tuned (token, block_m, kernelName1) for the requested shape
@@ -451,7 +461,10 @@ def main():
 
         d = gen(token, args.model_dim, args.inter_dim, args.experts, args.topk, sort_bm,
                 adtype=args.adtype)
-        if v2_g2 is not None:
+        if args.v2_only:
+            # --v2-only: skip the baseline side entirely, only run the v2 kernels.
+            base_us, base_ok = float("nan"), -1
+        elif v2_g2 is not None:
             # v2-pinned gemm2 row: the CSV's chosen gemm2 IS the v2 kernel, so
             # the baseline side is that same v2 kernel. Time it below (after the
             # v2 config + inputs are built) so both columns measure it and match.
@@ -509,7 +522,8 @@ def main():
                     args.model_dim, args.inter_dim, args.experts, args.topk, token
                 )
                 if v2_g2 is not None:
-                    # The producer is baseline gemm1, so use its sort padding unit.
+                    # Align the sort padding unit to the CSV kernelName1 tile
+                    # (shared SBM for the gemm1 producer and gemm2).
                     BM_S1 = sort_bm
                 if BM_S1 % BM_v2 != 0:
                     # gemm2 consumes an SBM-strided sorted stream and requires SBM
@@ -529,7 +543,8 @@ def main():
             use_nt = v2_g2["use_nt"]
             BM_S1 = v2_g2["sort_block_m"] or BM_S1
             if v2_g2 is not None:
-                # Producer is baseline gemm1; align sort unit to its tile.
+                # Align the sort unit to the CSV kernelName1 tile (shared SBM
+                # for the gemm1 producer and gemm2).
                 BM_S1 = sort_bm
             if BM_S1 % BM_v2 != 0:
                 BM_S1 = BM_v2
@@ -553,9 +568,9 @@ def main():
                     args.experts, args.topk, BM_S1, BM_v2, use_nt, epilog, persist,
                     BN_v2, KW_v2, base_gemm1_params=params1,
                     print_output=args.print_output,
-                    use_flydslv2_producer=v2_g2 is not None,
+                    use_baseline_producer=args.baseline_producer,
                 )
-                if v2_g2 is not None:
+                if v2_g2 is not None and not args.v2_only:
                     # The CSV's chosen gemm2 is this same v2 kernel, so the
                     # baseline column re-times it independently -- both sides
                     # measure the identical kernel and should match.
@@ -563,7 +578,7 @@ def main():
                         d, v, token, args.model_dim, args.inter_dim,
                         args.experts, args.topk, BM_S1, BM_v2, use_nt, epilog,
                         persist, BN_v2, KW_v2, base_gemm1_params=params1,
-                        use_flydslv2_producer=True,
+                        use_baseline_producer=args.baseline_producer,
                     )
         except Exception as e:
             v2_us, v2_nz = float("nan"), -1
