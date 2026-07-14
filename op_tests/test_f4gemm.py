@@ -25,6 +25,7 @@ from aiter import dtypes
 from aiter.ops.shuffle import shuffle_weight_f4, shuffle_scale_f4
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 from aiter.utility import fp4_utils
+from aiter.utility.mx_types import MxDtypeInt
 from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 
 try:
@@ -42,6 +43,29 @@ pd.set_option("display.width", 1000)
 SUPPORTED_GFX = ["gfx1250"]  # gfx1250-only F4GEMM (preload SGPR) path
 MXFP4_SCALE_BLOCK = 32
 NVFP4_SCALE_BLOCK = 16
+# mxfp8 OUTPUT block size along N: the kernel quantizes each 128-wide output block
+# to fp8 e4m3 + one E8M0 scale (see aiter.ops.gemm_op_a4w4.MXFP8_OUT_SCALE_BLOCK).
+MXFP8_OUT_SCALE_BLOCK = 128
+
+
+def _quant_mxfp8_blockN(x_f32, block=MXFP8_OUT_SCALE_BLOCK):
+    """CPU golden for the kernel's on-the-fly mxfp8 output quant: per-128-column
+    block, RoundUp E8M0 scale + RNE e4m3 data. Returns (fp8 [M,N], e8m0 [M,N/block])."""
+    M, N = x_f32.shape
+    assert N % block == 0, f"mxfp8 golden requires N % {block} == 0"
+    xb = x_f32.reshape(M, N // block, block)
+    amax = xb.abs().amax(dim=-1)  # per-block max(|x|)  [M, N/block]
+    scale_e8m0 = fp4_utils.f32_to_mx_e8m0_scale(amax, dtype=MxDtypeInt.FP8_E4M3)
+    scale_f32 = fp4_utils.e8m0_to_f32(scale_e8m0).unsqueeze(-1)
+    q_fp8 = (xb / scale_f32).reshape(M, N).to(dtypes.fp8)  # RNE cast to e4m3
+    return q_fp8, scale_e8m0
+
+
+def _dequant_mxfp8_blockN(q_fp8, scale_e8m0, block=MXFP8_OUT_SCALE_BLOCK):
+    """Inverse of :func:`_quant_mxfp8_blockN` for the end-to-end value compare."""
+    M, N = q_fp8.shape
+    scale_f32 = fp4_utils.e8m0_to_f32(scale_e8m0).unsqueeze(-1)
+    return (q_fp8.float().reshape(M, N // block, block) * scale_f32).reshape(M, N)
 
 # checkAllclose returns 0 when all-close, else the mismatch fraction. Its own
 # verdict thresholds: pass (0) / warning (<= tol_err_ratio) / failed (above).
@@ -159,12 +183,22 @@ def test_gemm(intype, M, N, K, apre, scale, outtype, data_init, scale_init, seed
     # quantized to e2m1 (cvt_scale=1) and written 2 vals/byte, so the reference
     # must quantize the same way and the output tensor is fp4x2 [M, N//2].
     out_fp4 = outtype == "fp4"
-    out_dtype = dtypes.fp4x2 if out_fp4 else dtype
+    # outtype=mxfp8 selects the fp8-output kernel: the fp32 result is quantized
+    # per 128-wide N block to fp8 e4m3 + one E8M0 scale (computed in-kernel), so
+    # the reference quantizes the same way and the op returns (fp8, e8m0) tuple.
+    out_mxfp8 = outtype == "mxfp8"
+    out_dtype = dtypes.fp4x2 if out_fp4 else (dtypes.fp8 if out_mxfp8 else dtype)
     gen = bench_init.make_generator(seed)  # fixed seed -> bit-identical buffers
     prep = _prep_mxfp4 if intype == "mxfp4" else _prep_nvfp4
     inp, ref_f32 = prep(M, N, K, apre, data_init, scale_init, gen, noscale=noscale)
-    # Reference in the kernel's output form: quantized e2m1 for fp4, else bf16.
-    ref = fp4_utils.f32_to_mxfp4(ref_f32) if out_fp4 else ref_f32.to(dtype)
+    # Reference in the kernel's output form: packed e2m1 for fp4, block-scaled
+    # (fp8 e4m3 data + e8m0 scale) tuple for mxfp8, else bf16.
+    if out_fp4:
+        ref = fp4_utils.f32_to_mxfp4(ref_f32)
+    elif out_mxfp8:
+        ref = _quant_mxfp8_blockN(ref_f32)  # (ref_fp8, ref_scale_e8m0)
+    else:
+        ref = ref_f32.to(dtype)
     needTrace = mode == "profile"
     num_iters = 5 if mode == "func" else 101
 
@@ -202,8 +236,14 @@ def test_gemm(intype, M, N, K, apre, scale, outtype, data_init, scale_init, seed
     candidates = {"asm": run_asm}
 
     flops = 2 * M * N * K
-    # Output bytes: packed fp4 is M*N/2 bytes; bf16 is M*N*itemsize.
-    out_bytes = (M * N) // 2 if out_fp4 else M * N * dtype.itemsize
+    # Output bytes: packed fp4 = M*N/2; mxfp8 = M*N (fp8) + M*N/128 (e8m0 scale);
+    # bf16 = M*N*itemsize.
+    if out_fp4:
+        out_bytes = (M * N) // 2
+    elif out_mxfp8:
+        out_bytes = M * N + M * (N // MXFP8_OUT_SCALE_BLOCK)
+    else:
+        out_bytes = M * N * dtype.itemsize
     nbytes = (
         inp["A"].nbytes
         + inp["B"].nbytes
@@ -241,6 +281,24 @@ def test_gemm(intype, M, N, K, apre, scale, outtype, data_init, scale_init, seed
                 fp4_utils.mxfp4_to_f32(out),
                 rtol=0, atol=0, msg=f"{intype} {name} fp4",
             )
+        elif out_mxfp8:
+            # op returns (fp8 data, e8m0 scale). The E8M0 scale is a deterministic
+            # RoundUp function of the block amax -> require an exact byte match;
+            # the fp8 e4m3 data may differ on RNE ties, so compare the dequantized
+            # (data*scale) product with a tolerance instead.
+            ref_fp8, ref_scale = ref
+            out_fp8, out_scale = out
+            err_s = checkAllclose(
+                ref_scale.view(torch.uint8).float(),
+                out_scale.view(torch.uint8).float(),
+                rtol=0, atol=0, msg=f"{intype} {name} mxfp8 e8m0",
+            )
+            err_d = checkAllclose(
+                _dequant_mxfp8_blockN(ref_fp8, ref_scale),
+                _dequant_mxfp8_blockN(out_fp8, out_scale),
+                rtol=1e-1, atol=1.0, msg=f"{intype} {name} mxfp8",
+            )
+            err = max(err_s, err_d)
         else:
             err = checkAllclose(ref, out, rtol=1e-1, atol=1.0, msg=f"{intype} {name}")
         ret[f"{name} us"] = round(us, 2)
@@ -293,10 +351,11 @@ def main():
     parser.add_argument(
         "--outtype",
         nargs="*",
-        choices=["bf16", "fp4"],
+        choices=["bf16", "fp4", "mxfp8"],
         default=["bf16"],
-        help="output-format sweep list: bf16 (default) or fp4 (packed e2m1, "
-        "cvt_scale=1; needs the f4gemm_fp4_*.co, see f4gemm.csv)",
+        help="output-format sweep list: bf16 (default), fp4 (packed e2m1, "
+        "cvt_scale=1) or mxfp8 (fp8 e4m3 data + per-128 e8m0 scale); the fp4/"
+        "mxfp8 variants need the f4gemm_{fp4,mxfp8}_*.co, see f4gemm.csv",
     )
     parser.add_argument(
         "--data-init",
