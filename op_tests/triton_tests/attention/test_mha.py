@@ -9,10 +9,7 @@ from aiter.ops.triton.attention.mha import (
     flash_attn_varlen_func,
     mha_set_use_fused_bwd_kernel,
     mha_set_use_int64_strides,
-)
-from aiter.ops.triton._gluon_kernels.gfx950.attention.mha_gluon import (
     gluon_forward_unsupported_reason,
-    mha_set_use_int64_strides as gluon_mha_set_use_int64_strides,
 )
 from aiter.test_mha_common import (
     attention_ref,
@@ -214,8 +211,6 @@ def test_mha_int64_strides(
     # use int64 strides for the backend under test.
     # NOTE: if you set this to false this test case will segfault
     mha_set_use_int64_strides(True)
-    if is_gluon:
-        gluon_mha_set_use_int64_strides(True)
 
     # generate inputs with large strides
     def _generate_input(
