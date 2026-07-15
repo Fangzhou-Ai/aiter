@@ -12,6 +12,7 @@ from aiter.ops.triton.attention.mha import (
 )
 from aiter.ops.triton._gluon_kernels.gfx950.attention.mha_gluon import (
     gluon_forward_unsupported_reason,
+    mha_set_use_int64_strides as gluon_mha_set_use_int64_strides,
 )
 from aiter.test_mha_common import (
     attention_ref,
@@ -181,7 +182,9 @@ def test_mha_with_dropout(
 
 
 # LLaMA 3 405B config
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
 def test_mha_int64_strides(
+    backend: str,
     dtype=torch.bfloat16,
     test_backward=True,
 ):
@@ -194,12 +197,25 @@ def test_mha_int64_strides(
     """
     In the absence of strides being int64, parts of the offset computation is done in 32 bit and overflows resulting in segfaults.
     """
+    # The Gluon backend is forward-only and cannot return LSE, so drop both for it.
+    is_gluon = backend == "gluon"
+    return_lse = not is_gluon
+    test_backward = test_backward and not is_gluon
+    _skip_if_gluon_unsupported(
+        backend,
+        HEAD_SZ,
+        NUM_K_HEADS,
+        dropout_p=DROPOUT,
+        return_lse=return_lse,
+    )
+
     torch.cuda.empty_cache()
     torch.manual_seed(20)
-    # use int64 strides.
-    mha_set_use_int64_strides(
-        True
-    )  # NOTE: if you set this to false this test case will segfault
+    # use int64 strides for the backend under test.
+    # NOTE: if you set this to false this test case will segfault
+    mha_set_use_int64_strides(True)
+    if is_gluon:
+        gluon_mha_set_use_int64_strides(True)
 
     # generate inputs with large strides
     def _generate_input(
@@ -243,7 +259,7 @@ def test_mha_int64_strides(
         print("cu_seqlens_q:", cu_seqlens_q.shape, cu_seqlens_q.stride())
         print("cu_seqlens_k:", cu_seqlens_k.shape, cu_seqlens_k.stride())
 
-    triton_out, _ = flash_attn_varlen_func(
+    out = flash_attn_varlen_func(
         q,
         k,
         v,
@@ -253,8 +269,10 @@ def test_mha_int64_strides(
         max_seqlens_k,
         dropout_p=DROPOUT,
         causal=CAUSAL,
-        return_lse=True,
+        return_lse=return_lse,
+        backend=backend,
     )
+    triton_out = out[0] if return_lse else out
     if test_backward:
         triton_dq, triton_dk, triton_dv = torch.autograd.grad(
             triton_out, (q, k, v), do.clone()

@@ -74,6 +74,14 @@ from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 _GLUON_SUPPORTED_ARCHS = ("gfx950",)
 _TRITON_GE_36 = Version(triton.__version__) >= Version("3.6.0")
 
+_USE_INT64_STRIDES = True
+
+
+def mha_set_use_int64_strides(value: bool):
+    """Use 64-bit integer strides to prevent integer overflows with very large tensors."""
+    global _USE_INT64_STRIDES
+    _USE_INT64_STRIDES = value
+
 
 def is_gluon_available() -> bool:
     """True when this Gluon MHA forward kernel can actually run on this device."""
@@ -135,7 +143,7 @@ def gluon_forward_unsupported_reason(
     if head_dim is not None:
         # Known-bug: a padded head_dim (padded up to a power of 2 >= 32) whose
         # per-head size is not a multiple of 16 elements fails to legalize the
-        # masked async global->LDS copy during compilation on gfx950. 
+        # masked async global->LDS copy during compilation on gfx950.
         padded_head = head_dim != max(triton.next_power_of_2(head_dim), 32)
         if padded_head and head_dim % 16 != 0:
             return (
@@ -671,6 +679,7 @@ _attn_fwd_repr = make_kernel_repr(
         "BLOCK_DMODEL",
         "VARLEN",
         "NUM_XCD",
+        "USE_INT64_STRIDES",
     ],
 )
 
@@ -686,22 +695,22 @@ def _attn_fwd(
     cu_seqlens_k,
     SEQLEN_Q,
     SEQLEN_K,
-    stride_qz,
-    stride_qh,
-    stride_qm,
-    stride_qk,  #
-    stride_kz,
-    stride_kh,
-    stride_kn,
-    stride_kk,  #
-    stride_vz,
-    stride_vh,
-    stride_vn,
-    stride_vk,  #
-    stride_oz,
-    stride_oh,
-    stride_om,
-    stride_on,  #
+    stride_qz_in,
+    stride_qh_in,
+    stride_qm_in,
+    stride_qk_in,  #
+    stride_kz_in,
+    stride_kh_in,
+    stride_kn_in,
+    stride_kk_in,  #
+    stride_vz_in,
+    stride_vh_in,
+    stride_vn_in,
+    stride_vk_in,  #
+    stride_oz_in,
+    stride_oh_in,
+    stride_om_in,
+    stride_on_in,  #
     NUM_Q_HEADS: gl.constexpr,
     NUM_K_HEADS: gl.constexpr,
     IS_CAUSAL: gl.constexpr,
@@ -713,11 +722,54 @@ def _attn_fwd(
     BLOCK_DMODEL_POW2: gl.constexpr,
     PRELOAD_V: gl.constexpr,
     NUM_XCD: gl.constexpr,
+    USE_INT64_STRIDES: gl.constexpr,
     HEAD_STRIDE_ALIGNED_8: gl.constexpr = False,
     num_warps: gl.constexpr = 4,
 ):
     RCP_LN2: gl.constexpr = 1.4426950408889634
     PADDED_HEAD: gl.constexpr = BLOCK_DMODEL != BLOCK_DMODEL_POW2
+
+    # NOTE:
+    # Base-pointer and seqlen-loop offset arithmetic is performed using the
+    # stride's integer width. With 32-bit strides, these products can overflow
+    # and cause segfaults on very large tensors. Upcasting the strides to int64
+    # ensures that this arithmetic uses 64-bit precision. The per-tile offset
+    # tensors are still downcast to int32 for buffer_load, which is safe, as a
+    # single tile's offsets are small.
+    if USE_INT64_STRIDES:
+        stride_qz = gl.cast(stride_qz_in, gl.int64)
+        stride_qh = gl.cast(stride_qh_in, gl.int64)
+        stride_qm = gl.cast(stride_qm_in, gl.int64)
+        stride_qk = gl.cast(stride_qk_in, gl.int64)
+        stride_kz = gl.cast(stride_kz_in, gl.int64)
+        stride_kh = gl.cast(stride_kh_in, gl.int64)
+        stride_kn = gl.cast(stride_kn_in, gl.int64)
+        stride_kk = gl.cast(stride_kk_in, gl.int64)
+        stride_vz = gl.cast(stride_vz_in, gl.int64)
+        stride_vh = gl.cast(stride_vh_in, gl.int64)
+        stride_vn = gl.cast(stride_vn_in, gl.int64)
+        stride_vk = gl.cast(stride_vk_in, gl.int64)
+        stride_oz = gl.cast(stride_oz_in, gl.int64)
+        stride_oh = gl.cast(stride_oh_in, gl.int64)
+        stride_om = gl.cast(stride_om_in, gl.int64)
+        stride_on = gl.cast(stride_on_in, gl.int64)
+    else:
+        stride_qz = stride_qz_in
+        stride_qh = stride_qh_in
+        stride_qm = stride_qm_in
+        stride_qk = stride_qk_in
+        stride_kz = stride_kz_in
+        stride_kh = stride_kh_in
+        stride_kn = stride_kn_in
+        stride_kk = stride_kk_in
+        stride_vz = stride_vz_in
+        stride_vh = stride_vh_in
+        stride_vn = stride_vn_in
+        stride_vk = stride_vk_in
+        stride_oz = stride_oz_in
+        stride_oh = stride_oh_in
+        stride_om = stride_om_in
+        stride_on = stride_on_in
 
     # program -> (batch, q_head, query block). SEQLEN_Q is the max query length,
     # so NUM_BLOCKS_M matches the launch grid in both fixed and varlen mode.
@@ -1102,6 +1154,7 @@ def _validate_and_launch(
         BLOCK_DMODEL_POW2=BLOCK_DMODEL_POW2,
         PRELOAD_V=True,
         NUM_XCD=get_num_xcds(),
+        USE_INT64_STRIDES=_USE_INT64_STRIDES,
         HEAD_STRIDE_ALIGNED_8=head_stride_aligned_8,
         num_warps=4,
         waves_per_eu=2,
