@@ -26,36 +26,8 @@ import torch
 import triton
 from packaging.version import Version
 
-try:
-    from triton.experimental import gluon
-    from triton.experimental.gluon import language as gl
-
-    _GLUON_IMPORTED = True
-except Exception:  # pragma: no cover - depends on triton build / arch
-    # Keep this module importable on builds without Gluon so the wrapper and
-    # unit tests can query availability / feature support without a hard import
-    # failure. The @jit kernels below are never callable in this mode; callers
-    # guard on is_gluon_available() before dispatching to them.
-    import triton.language as gl  # provides gl.constexpr for the signatures
-
-    _GLUON_IMPORTED = False
-
-    class _GluonFallback:
-        @staticmethod
-        def jit(fn=None, **_kwargs):
-            def _wrap(f):
-                return f
-
-            return _wrap(fn) if fn is not None else _wrap
-
-        @staticmethod
-        def constexpr_function(fn=None, **_kwargs):
-            def _wrap(f):
-                return f
-
-            return _wrap(fn) if fn is not None else _wrap
-
-    gluon = _GluonFallback()
+from triton.experimental import gluon
+from triton.experimental.gluon import language as gl
 
 from aiter.ops.triton.utils.device_info import get_num_xcds
 from aiter.ops.triton.utils._triton.arch_info import get_arch
@@ -85,7 +57,7 @@ def mha_set_use_int64_strides(value: bool):
 
 def is_gluon_available() -> bool:
     """True when this Gluon MHA forward kernel can actually run on this device."""
-    if not (_GLUON_IMPORTED and _TRITON_GE_36):
+    if not _TRITON_GE_36:
         return False
     try:
         arch = get_arch() or ""
@@ -329,8 +301,7 @@ def _attn_softmax_pv(acc, l_i, m_i, qk, v, dotP: gl.constexpr):
     """Online-softmax rescale + P@V accumulation for one key block. qk holds the
     (masked) scores, v the value tile in dot-operand layout. Second half of one
     online-softmax step; returns updated (acc, l_i, m_i)."""
-    # Fully-masked rows leave m_ij == -inf and produce NaNs here; those rows are
-    # zeroed out in the epilogue.
+
     m_ij = gl.maximum(m_i, gl.max(qk, 1))
     p = gl.exp2(qk - m_ij[:, None])
     alpha = gl.exp2(m_i - m_ij)
@@ -1045,6 +1016,10 @@ def _attn_fwd(
     offs_om = start_m * BLOCK_M + offs_rm
     offs_od = gl.arange(0, BLOCK_DMODEL_POW2, layout=gl.SliceLayout(0, mfmaLayout))
 
+    # If seqlen_q > seqlen_k but the delta is not a multiple of BLOCK_M,
+    # then we have one block with a row of all NaNs which come from computing
+    # softmax over a row of all -infs (-inf - inf = NaN). We check for that here
+    # and store 0s where there are NaNs as these rows should've been zeroed out.
     end_m_idx = (start_m + 1) * BLOCK_M
     start_m_idx = start_m * BLOCK_M
     causal_start_idx = seqlen_q - seqlen_k
