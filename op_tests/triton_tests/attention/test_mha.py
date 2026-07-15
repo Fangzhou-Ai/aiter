@@ -119,7 +119,7 @@ def _test_mha_impl(
     [(1, 1), (128, 128), (32, 16), (64, 128), (2048, 2048)],
 )
 @pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(1, 1), (8, 8), (48, 8)])
-@pytest.mark.parametrize("HEAD_SZ", [64, 128])
+@pytest.mark.parametrize("HEAD_SZ", [33, 64, 128])
 @pytest.mark.parametrize("CAUSAL", [(True), (False)])
 @pytest.mark.parametrize("backend", ["triton", "gluon"])
 def test_mha(
@@ -416,7 +416,7 @@ def _test_mha_varlen_impl(
 @pytest.mark.parametrize(
     "NUM_Q_HEADS, NUM_K_HEADS", [(1, 1), (16, 16), (2, 1), (48, 8)]
 )
-@pytest.mark.parametrize("HEAD_SZ", [8, 32, 128])
+@pytest.mark.parametrize("HEAD_SZ", [8, 32, 33, 128])
 @pytest.mark.parametrize("CAUSAL", [(True), (False)])
 @pytest.mark.parametrize("backend", ["triton", "gluon"])
 def test_mha_varlen(

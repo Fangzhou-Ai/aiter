@@ -132,17 +132,15 @@ def gluon_forward_unsupported_reason(
         return "Gluon MHA backend does not support positional encoding"
     if block_table is not None:
         return "Gluon MHA backend does not support paged KV (block_table)"
-    if head_dim is not None and num_k_heads is not None:
-        # Known-bugged: a padded head_dim (padded up to a power of 2 >= 32)
-        # combined with a KV sequence stride (num_k_heads * head_dim) that is not
-        # a multiple of 16 elements fails to legalize the masked async
-        # global->LDS copy on gfx950.
+    if head_dim is not None:
+        # Known-bug: a padded head_dim (padded up to a power of 2 >= 32) whose
+        # per-head size is not a multiple of 16 elements fails to legalize the
+        # masked async global->LDS copy during compilation on gfx950. 
         padded_head = head_dim != max(triton.next_power_of_2(head_dim), 32)
-        if padded_head and (num_k_heads * head_dim) % 16 != 0:
+        if padded_head and head_dim % 16 != 0:
             return (
-                "Gluon MHA backend: padded head_dim with a non-16-element-aligned "
-                f"KV stride (head_dim={head_dim}, num_k_heads={num_k_heads}) is "
-                "currently broken"
+                "Gluon MHA backend: padded head_dim that is not 16-element-aligned "
+                f"(head_dim={head_dim}) is currently broken"
             )
     return None
 
@@ -162,8 +160,10 @@ def _make_kv_shared_layouts(
         min(non_k_dim, num_threads_same_cycle) // per_phase,
         bank_line_elems // swizzle_vec,
     )
-    k_shared = gl.SwizzledSharedLayout(swizzle_vec, per_phase, max_phase, order=[0, 1])
-    v_shared = gl.SwizzledSharedLayout(swizzle_vec, per_phase, max_phase, order=[1, 0])
+    # k_shared = gl.SwizzledSharedLayout(swizzle_vec, per_phase, max_phase, order=[0, 1])
+    # v_shared = gl.SwizzledSharedLayout(swizzle_vec, per_phase, max_phase, order=[1, 0])
+    k_shared = gl.SwizzledSharedLayout(1, 1, 1, order=[0, 1])
+    v_shared = gl.SwizzledSharedLayout(1, 1, 1, order=[1, 0])
     return k_shared, v_shared
 
 
