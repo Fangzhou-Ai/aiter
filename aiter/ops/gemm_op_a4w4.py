@@ -332,6 +332,8 @@ def _alloc_f4gemm_out_scale(
     assert (
         N % MXFP8_OUT_SCALE_BLOCK == 0
     ), f"mxfp8 output requires N % {MXFP8_OUT_SCALE_BLOCK} == 0, got N={N}"
+    # Output-scale packed layout (M/64, scaleN, 16, 4) requires M % 64 == 0.
+    assert M % 64 == 0, f"mxfp8 output-scale packing requires M % 64 == 0, got M={M}"
     return torch.empty(
         (M, N // MXFP8_OUT_SCALE_BLOCK), dtype=dtypes.fp8_e8m0, device=device
     )
