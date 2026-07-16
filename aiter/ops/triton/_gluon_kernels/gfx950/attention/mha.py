@@ -44,10 +44,8 @@ def _make_kv_shared_layouts(
         min(non_k_dim, num_threads_same_cycle) // per_phase,
         bank_line_elems // swizzle_vec,
     )
-    # k_shared = gl.SwizzledSharedLayout(swizzle_vec, per_phase, max_phase, order=[0, 1])
-    # v_shared = gl.SwizzledSharedLayout(swizzle_vec, per_phase, max_phase, order=[1, 0])
-    k_shared = gl.SwizzledSharedLayout(1, 1, 1, order=[0, 1])
-    v_shared = gl.SwizzledSharedLayout(1, 1, 1, order=[1, 0])
+    k_shared = gl.SwizzledSharedLayout(swizzle_vec, per_phase, max_phase, order=[0, 1])
+    v_shared = gl.SwizzledSharedLayout(swizzle_vec, per_phase, max_phase, order=[1, 0])
     return k_shared, v_shared
 
 
