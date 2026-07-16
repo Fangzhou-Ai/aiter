@@ -53,6 +53,7 @@ opus_moe_stage2_route_reduce_pack_bf16x4(const float* acc, int base)
         opus_moe_gfx950_cvt_pk_bf16_f32(acc[base + 2], acc[base + 3]);
     return static_cast<uint64_t>(packed01) | (static_cast<uint64_t>(packed23) << 32);
 }
+
 #endif
 
 // ROUTE_FP8 selects the packed MXFP8 path at compile time. Unlike decode, this
