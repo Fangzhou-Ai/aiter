@@ -77,6 +77,17 @@ route-reduce tile width is
 `aiter/ops/opus/moe_stage2_a8w4_meta.py`. `-1` remains the direct-atomic auto
 selector.
 
+Experimental A8W4 stage1 ids use the 10xx namespace.
+
+These stage1 ids are experimental. They are reachable through the explicit
+`opus_moe_stage1_a8w4_fwd` API, the Python wrapper
+`aiter/ops/opus/moe_stage1_a8w4.py`, and opt-in flags in
+`csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py`. They are not used by
+fused MoE default dispatch; the current DSV4 tuned CSV does not contain
+`opus_moe1_a8w4_*` entries. The authoritative stage1 candidate list lives in
+`aiter/ops/opus_moe_stage1_a8w4_meta.py`; the stage1 subdirectory README
+summarizes the current 10xx table.
+
 In fused MoE tuned configs, the preferred A8W4 stage2 selection is a per-kid
 `kernelName2` value from metadata. The generic wrapper name
 `opus_moe_stage2_a8w4_decode` is still accepted for rows that carry explicit
@@ -124,30 +135,43 @@ gfx950 code:
 - `include/gfx950/a8w4/opus_moe_stage2_a8w4_decode_dispatch_gfx950.cuh`:
   A8W4 kid-to-trait dispatch. The switch cases are generated into
   `opus_moe_stage2_a8w4_manifest.h`.
+- `include/gfx950/a8w4/stage1/`: isolated A8W4 stage1 structure for traits,
+  policy, mainloop, epilogue, pipeline/kernel entry, and generated manifest
+  dispatch. It is wired only through the explicit stage1 host/Python API while
+  experimental, and is not selected by fused MoE serving dispatch.
 
 Python/JIT code:
 
 - `aiter/ops/opus/moe_stage2_a8w4_meta.py`: torch-free A8W4 stage2 kid
   metadata shared by runtime wrapper and csrc tuner/codegen helpers.
+- `aiter/ops/opus_moe_stage1_a8w4_meta.py`: torch-free A8W4 stage1 kid
+  metadata shared by runtime wrapper and csrc tuner/codegen helpers.
+- `aiter/ops/opus/moe_stage1_a8w4.py`: experimental A8W4 stage1 Python
+  wrapper for local replay work. It is not used by fused MoE default dispatch.
 - `aiter/ops/opus/moe_stage2_a8w4.py`: A8W4 Python wrapper and route-output
   reduce wrapper.
 - `aiter/ops/opus/moe_stage2_a8w4_fused_adapter.py`: fused MoE CSV parsing and
   stage2 wrapper glue for A8W4.
-- `gen_instances.py`: JIT-time private BF16 and A8W4 manifest generator.
-- `opus_moe_common.py`: private BF16 metadata plus the A8W4 metadata bridge for
-  manifest codegen.
+- `gen_instances.py`: JIT-time private BF16 and A8W4 manifest generator,
+  including the experimental stage1 A8W4 manifests.
+- `opus_moe_common.py`: private BF16 metadata plus the A8W4 stage1/stage2
+  metadata bridge for manifest codegen.
 
 ## Tuning and Dispatch
 
 `gen_instances.py` emits `opus_moe_stage2_manifest.h` and
-`opus_moe_stage2_a8w4_manifest.h` into the JIT build blob. The first generated
-header is consumed by private BF16 dispatch source; the second is consumed by
-the A8W4 dispatch wrapper for
-`kid -> OpusMoeStage2A8W4DecodeShape -> launcher` cases.
+`opus_moe_stage2_a8w4_manifest.h`, `opus_moe_stage2_a8w4_meta.h`,
+`opus_moe_stage1_a8w4_manifest.h`, and `opus_moe_stage1_a8w4_meta.h` into the
+JIT build blob. The BF16 manifest is consumed by private BF16 dispatch source;
+the A8W4 manifests are consumed by stage1/stage2 dispatch wrappers for
+`kid -> traits -> launcher` cases.
 
-A8W4 production selection should be done through the fused MoE tuned
+A8W4 production stage2 selection should be done through the fused MoE tuned
 configuration by adding `opus_...` stage2 kernel names only for measured cases
-where Opus is correct and faster than the baseline.
+where Opus is correct and faster than the baseline. A8W4 stage1 remains an
+explicit replay/tuner path until measured `opus_moe1_a8w4_*` CSV entries are
+added intentionally. The A8W4 kernels are not selected through
+`opus_moe_tune.py`.
 
 ## Validation
 

@@ -378,6 +378,9 @@ OPUS_A8W4_STAGE2_BY_NAME = _build_stage2_by_name()
 OPUS_A8W4_SUPPORTED_BLOCK_MS = tuple(
     sorted({inst.block_m for inst in OPUS_A8W4_STAGE2_INSTANCES})
 )
+OPUS_A8W4_SUPPORTED_SORT_BLOCK_MS = tuple(
+    sorted({inst.sort_block_m for inst in OPUS_A8W4_STAGE2_INSTANCES})
+)
 
 
 def _build_mode_default_by_mode_block_m() -> dict[tuple[int, int], int]:
@@ -496,6 +499,10 @@ def opus_a8w4_kid_block_m(kid: int) -> int:
     return _require_a8w4_stage2_instance(kid).block_m
 
 
+def opus_a8w4_kid_sort_block_m(kid: int) -> int:
+    return _require_a8w4_stage2_instance(kid).sort_block_m
+
+
 def opus_a8w4_kid_reduce_block_n(kid: int) -> Optional[int]:
     route_reduce = opus_a8w4_route_reduce(
         _require_a8w4_stage2_instance(kid).route_reduce
@@ -505,6 +512,10 @@ def opus_a8w4_kid_reduce_block_n(kid: int) -> Optional[int]:
 
 def opus_a8w4_supported_block_ms() -> tuple[int, ...]:
     return OPUS_A8W4_SUPPORTED_BLOCK_MS
+
+
+def opus_a8w4_supported_sort_block_ms() -> tuple[int, ...]:
+    return OPUS_A8W4_SUPPORTED_SORT_BLOCK_MS
 
 
 def opus_a8w4_best_atomic_kid(
