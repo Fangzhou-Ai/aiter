@@ -34,6 +34,7 @@ view to :func:`emit_mx_e8m0_scale` -- both round-trip through
 
 from __future__ import annotations
 
+from flydsl._mlir.dialects import llvm
 from flydsl.expr import arith
 from flydsl.expr.typing import T
 from flydsl.expr.arith import CmpIPredicate
@@ -244,3 +245,40 @@ def emit_f32_to_e2m1(qx_f32):
     e2m1 = arith.select(normal_mask, normal_x, c0x7_i32)
     e2m1 = arith.select(denormal_mask, denormal_x, e2m1)
     return (s >> c28_i32) | e2m1
+
+
+def _raw(value):
+    """Unwrap a DSL Numeric to a raw ir.Value (rocdl/inline_asm need raw operands)."""
+    return value.ir_value() if hasattr(value, "ir_value") else value
+
+
+def emit_cvt_scalef32_pk8_fp8_bf16(src_v8bf16, scale_f32, *, v2i32_ty):
+    """Native gfx1250 ``v_cvt_scalef32_pk8_fp8_bf16``: 8 bf16 -> 8 fp8 e4m3.
+
+    ``src_v8bf16`` is a ``vector<8, bf16>`` ir.Value, ``scale_f32`` an f32 whose
+    exponent is the e8m0 block scale (2^(e8m0-127)); the HW divides each input
+    by it and RNE-packs 8 fp8 e4m3 bytes into a ``vector<2, i32>``.
+    """
+    return llvm.inline_asm(
+        v2i32_ty,
+        [_raw(src_v8bf16), _raw(scale_f32)],
+        "v_cvt_scalef32_pk8_fp8_bf16 $0, $1, $2",
+        "=v,v,v",
+        has_side_effects=False,
+    )
+
+
+def emit_cvt_scalef32_pk8_fp4_bf16(src_v8bf16, scale_f32, *, i32_ty):
+    """Native gfx1250 ``v_cvt_scalef32_pk8_fp4_bf16``: 8 bf16 -> 8 fp4 nibbles.
+
+    ``src_v8bf16`` is a ``vector<8, bf16>`` ir.Value, ``scale_f32`` an f32 whose
+    exponent is the e8m0 block scale; the HW divides each input by it and
+    RNE-packs 8 fp4 (e2m1) nibbles into a single i32.
+    """
+    return llvm.inline_asm(
+        i32_ty,
+        [_raw(src_v8bf16), _raw(scale_f32)],
+        "v_cvt_scalef32_pk8_fp4_bf16 $0, $1, $2",
+        "=v,v,v",
+        has_side_effects=False,
+    )
