@@ -764,10 +764,24 @@ def _mla_softmax_reducev_kernel(
     HEAD_DIM_CKV: tl.constexpr,
     HAS_FINAL_LSE: tl.constexpr,
     USE_2D_VIEW: tl.constexpr,
+    BLOCK_S: tl.constexpr,
+    D_SPLIT: tl.constexpr,
 ):
+    """Merge the per-split (acc, lse) partials, BLOCK_S splits at a time.
+
+    BLOCK_S=1, D_SPLIT=1 reproduces the original scalar walk exactly. Larger
+    values only re-associate the same online-softmax merge: BLOCK_S splits are
+    loaded as one [BLOCK_S, BLOCK_D] tile so the serial rescale chain is BLOCK_S
+    times shorter and the memory system sees BLOCK_S independent loads, and the
+    head dim is tiled across D_SPLIT programs on grid axis 2. Each head-dim slice
+    re-derives the same scalar lse statistics from the same Mid_lse vector and
+    owns a disjoint slice of `o`, so the slices never communicate.
+    """
     cur_batch = tl.program_id(0)
     cur_head = tl.program_id(1)
-    q_pos = tl.program_id(2)
+    # Grid axis 2 packs (q_pos, head-dim slice).
+    q_pos = tl.program_id(2) // D_SPLIT
+    cur_d = tl.program_id(2) % D_SPLIT
 
     # Recompute this batch's seq len exactly as the decode kernel did, so we can
     # rederive which splits are empty. Stage-1 early-returns on empty splits
@@ -780,36 +794,46 @@ def _mla_softmax_reducev_kernel(
         cur_batch_seq_len = tl.load(B_seq_len + cur_batch + 1) - batch_page_start
     kv_len_per_split = cur_batch_seq_len // NUM_KV_SPLITS
 
-    offs_d_ckv = tl.arange(0, HEAD_DIM_CKV)
+    BLOCK_D: tl.constexpr = HEAD_DIM_CKV // D_SPLIT
+    offs_d_ckv = cur_d * BLOCK_D + tl.arange(0, BLOCK_D)
     offs_l = cur_batch * stride_l_b + q_pos * stride_l_qs + cur_head * stride_l_h + offs_d_ckv
     offs_ml = cur_batch * stride_ml_b + q_pos * stride_ml_qs + cur_head * stride_ml_h
+    offs_s = tl.arange(0, BLOCK_S)
 
     e_sum = 0.0
     e_max = -float("inf")
-    acc = tl.zeros([HEAD_DIM_CKV], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_D], dtype=tl.float32)
 
     LOOP_START = NUM_KV_SPLITS - 1 if kv_len_per_split == 0 else 0
-    for split_kv_id in range(LOOP_START, NUM_KV_SPLITS):
-        logits = tl.load(Logits + offs_l + split_kv_id * stride_l_s)
-        logits_1 = tl.load(Mid_lse + offs_ml + split_kv_id * stride_ml_s)
+    # Same empty-split semantics as the scalar walk: start on a block boundary at
+    # or below LOOP_START and mask the uninitialised slots off inside the block.
+    BLK_START = (LOOP_START // BLOCK_S) * BLOCK_S
+    for split_kv_id in range(BLK_START, NUM_KV_SPLITS, BLOCK_S):
+        s = split_kv_id + offs_s
+        s_ok = (s >= LOOP_START) & (s < NUM_KV_SPLITS)
+        # [BLOCK_S] per-split lse; a masked slot carries no weight.
+        logits_1 = tl.load(Mid_lse + offs_ml + s * stride_ml_s, mask=s_ok, other=-float("inf"))
+        # [BLOCK_S, BLOCK_D] per-split partial numerators.
+        logits = tl.load(Logits + offs_l[None, :] + s[:, None] * stride_l_s, mask=s_ok[:, None], other=0.0)
 
-        n_e_max = tl.maximum(logits_1, e_max)
+        n_e_max = tl.maximum(tl.max(logits_1, 0), e_max)
         old_scale = tl.where(e_max == -float("inf"), 0.0, tl.exp(e_max - n_e_max))
-        acc *= old_scale
         exp_logic = tl.where(logits_1 == -float("inf"), 0.0, tl.exp(logits_1 - n_e_max))
-        # MTP: a fully causal-masked split stores NaN logits with lse=-inf; guard
-        # the accumulate so NaN*0 doesn't poison acc (no-op for plain decode).
-        acc += tl.where(logits_1 == -float("inf"), 0.0, exp_logic * logits)
+        # MTP: a fully causal-masked split stores NaN logits with lse=-inf; drop
+        # the whole row so NaN*0 doesn't poison acc (no-op for plain decode).
+        contrib = tl.where(logits_1[:, None] == -float("inf"), 0.0, exp_logic[:, None] * logits)
 
-        e_sum = e_sum * old_scale + exp_logic
+        acc = acc * old_scale + tl.sum(contrib, 0)
+        e_sum = e_sum * old_scale + tl.sum(exp_logic, 0)
         e_max = n_e_max
 
-    out = acc / e_sum if e_sum > 0.0 else tl.zeros([HEAD_DIM_CKV], dtype=tl.float32)
+    out = acc / e_sum if e_sum > 0.0 else tl.zeros([BLOCK_D], dtype=tl.float32)
     tl.store(
         O + cur_batch * stride_o_b + q_pos * stride_o_qs + cur_head * stride_o_h + offs_d_ckv,
         out,
     )
-    if HAS_FINAL_LSE:
+    # Every head-dim slice derived the same lse; slice 0 owns the one store.
+    if HAS_FINAL_LSE and cur_d == 0:
         tl.store(
             Final_lse + cur_batch * stride_fl_b + q_pos * stride_fl_qs + cur_head * stride_fl_h,
             e_max + tl.log(e_sum),
@@ -1148,8 +1172,22 @@ def mla_gluon(
         return o, final_lse
 
     # Stage-2: reduce per-split (acc, lse) into o (and lse when return_lse).
-    # grid axis 2 is q_pos (qlen). o uses the caller's layout (3-D or 4-D).
-    grid_reduce = (batch_size, nhead, qlen)
+    #
+    # The reduce walks the splits serially, and each step's rescale depends on the
+    # previous e_max while moving only head_dim_ckv elements, so a large split
+    # count turns it into a deep latency-bound chain. On a (batch, nhead, qlen)
+    # grid it is also only batch*nhead*qlen workgroups, which does not fill the
+    # device at small batch. Merge BLOCK_S splits per iteration to shorten the
+    # chain, and tile the head dim across D_SPLIT programs on grid axis 2 to widen
+    # the grid. BLOCK_S=1, D_SPLIT=1 is the original kernel.
+    RED_D_SPLIT = 8
+    while RED_D_SPLIT > 1 and (
+        head_dim_ckv % RED_D_SPLIT or head_dim_ckv // RED_D_SPLIT < 16
+    ):
+        RED_D_SPLIT //= 2
+    RED_BLOCK_S = min(256, triton.next_power_of_2(NUM_KV_SPLITS))
+    # grid axis 2 packs (q_pos, head-dim slice). o uses the caller's layout.
+    grid_reduce = (batch_size, nhead, qlen * RED_D_SPLIT)
     sl_b, sl_qs, sl_h, sl_split, _ = logits_buf.stride()
     _mla_softmax_reducev_kernel[grid_reduce](
         logits_buf,
@@ -1175,7 +1213,9 @@ def mla_gluon(
         HEAD_DIM_CKV=head_dim_ckv,
         HAS_FINAL_LSE=return_lse,
         USE_2D_VIEW=use_2d_view,
-        num_warps=8,
+        BLOCK_S=RED_BLOCK_S,
+        D_SPLIT=RED_D_SPLIT,
+        num_warps=4,
     )
 
     return o, final_lse
