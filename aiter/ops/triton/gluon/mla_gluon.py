@@ -496,7 +496,16 @@ def _mla_gluon(
     for i in range(num_iter - 2):
         async_idx = (buf_idx + 1) % 2
 
-        gl.amd.cdna4.async_copy.wait_group(0)
+        # Only the page numbers are needed here. Outstanding groups at this point,
+        # oldest first, are the four (three without PE) committed by the previous
+        # trip: page -> bufs_page[async_idx], then kv0, kpe and kv1 -> the buffers
+        # this trip reads at the local loads further down. Draining all of them
+        # (wait_group(0)) serialized the page prefetch chain behind the whole KV
+        # stream and left one KV block in flight; retiring just the oldest group
+        # keeps the previous trip's K/K_pe copies in flight across the issue block
+        # below, so two KV blocks are resident at no extra LDS. The prologue
+        # leaves the same set outstanding, so trip 0 behaves like the rest.
+        gl.amd.cdna4.async_copy.wait_group(3 if HAS_PE else 2)
         #### global load page number
         offs_n_page = start_n + BLOCK_N + offs_page_raw
         offs_page = batch_page_start + offs_n_page // PAGE_SIZE
@@ -540,6 +549,14 @@ def _mla_gluon(
             gl.amd.cdna4.async_copy.commit_group()
 
         #### dot, softmax, dot (part0)
+        # Second half of the split wait. The previous trip's K / K_pe copies into
+        # bufs_kv[buf_idx] / bufs_kpe[buf_idx] must have landed before these local
+        # loads. Outstanding here, oldest first: prev kv0, prev kpe, prev kv1,
+        # this page, this kv0, this kpe -- so leaving three pending (two without
+        # PE) retires exactly the three needed and keeps this trip's prefetches in
+        # flight through the MFMA and softmax block. Same granularity as
+        # epilogue 1's wait below.
+        gl.amd.cdna4.async_copy.wait_group(3 if HAS_PE else 2)
         k_c = gl.amd.cdna4.async_copy.load_shared_relaxed(bufs_kv.index(buf_idx), mfma_layout_b)
         zeros = gl.zeros([BLOCK_H, BLOCK_N], dtype=gl.float32, layout=mfma_layout)
         qk = gl.amd.cdna4.mfma(q_nope, k_c.to(dtype), zeros)
