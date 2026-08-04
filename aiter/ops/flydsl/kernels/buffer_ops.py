@@ -266,6 +266,61 @@ def get_element_ptr(
     ).result
 
 
+@dsl_loc_tracing
+def global_load_dwords(
+    base_ptr,
+    byte_offset,
+    *,
+    vec_width: int,
+    cache_modifier: int = 0,
+    address_space: int = 1,
+):
+    """Load ``vec_width`` i32 dwords from a global pointer via GEP + ``llvm.load``.
+
+    The counterpart to :func:`buffer_load` for offsets that do not fit a buffer
+    resource. ``buffer_load``'s voffset is 32-bit, so a single resource spanning a
+    tensor larger than 4 GB wraps; here the address is formed in full 64-bit by
+    the GEP, so the offset width is a non-issue. Lowers to ``global_load_dwordxN``
+    instead of ``buffer_load_dwordxN``.
+
+    The trade is that there is **no hardware bounds check**: a buffer resource
+    clamps to ``num_records`` (out-of-range reads return 0), a raw pointer does
+    not. The caller owns keeping ``byte_offset`` inside the allocation.
+
+    Args:
+        base_ptr: Allocation base -- an ``!llvm.ptr``, or an integer/index address
+            which is converted to one in ``address_space``.
+        byte_offset: Byte offset from ``base_ptr``. Widened to i64 by the GEP, so
+            it may exceed 2**32; pass it as index/i64 to keep it from being
+            truncated *before* it gets here.
+        vec_width: Number of i32 dwords (1, 2 or 4).
+        cache_modifier: Follows :func:`buffer_load`'s convention. Bit 1 (value 2)
+            is the non-temporal hint and maps to ``llvm.load``'s ``nontemporal``;
+            other bits have no ``llvm.load`` equivalent and are ignored.
+
+    The load is emitted with ``alignment = vec_width * 4``, so ``base_ptr +
+    byte_offset`` must be aligned to that. This holds for the preshuffled MoE
+    weight layouts, whose innermost dimension is the 16-byte kpack, making every
+    coarser stride a multiple of 16 -- but it is a real precondition, not a hint:
+    understating the alignment to LLVM is undefined behaviour.
+    """
+    if vec_width not in (1, 2, 4):
+        raise ValueError(f"vec_width must be 1, 2 or 4, got {vec_width}")
+
+    base_ptr = _unwrap_value(base_ptr)
+    if not str(base_ptr.type).startswith("!llvm.ptr"):
+        base_ptr = create_llvm_ptr(base_ptr, address_space=address_space)
+
+    ptr = get_element_ptr(base_ptr, byte_offset, elem_type=T.i8())
+    load_bytes = int(vec_width) * 4
+    return llvm.LoadOp(
+        ir.VectorType.get([int(vec_width)], ir.IntegerType.get_signless(32)),
+        ptr,
+        alignment=load_bytes,
+        nontemporal=bool(int(cache_modifier) & 2),
+    ).result
+
+
 class BufferResourceDescriptor:
     """AMD Buffer Resource Descriptor
 
