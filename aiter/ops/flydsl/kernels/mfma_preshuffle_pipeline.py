@@ -93,6 +93,38 @@ def _buffer_load_vec(
     return vector.bitcast(T.vec(int(vec_elems), elem_type), i32_vec)
 
 
+def _global_load_vec(
+    buffer_ops,
+    vector,
+    base_ptr,
+    idx,
+    *,
+    elem_type,
+    vec_elems,
+    elem_bytes,
+    offset_in_bytes,
+    cache_modifier=0,
+):
+    """Raw-pointer counterpart of :func:`_buffer_load_vec`.
+
+    Same unit convention for ``idx``, but the address is formed in full 64-bit by a
+    GEP, so it is not capped by ``buffer_load``'s 32-bit voffset -- which is what a
+    weight tensor over 4 GB needs. No hardware bounds check; see
+    ``buffer_ops.global_load_dwords``.
+    """
+    from flydsl.expr import arith as _ld_arith
+
+    elem_size = int(elem_bytes)
+    load_bytes = int(vec_elems) * elem_size
+    vec_width = load_bytes // 4
+
+    byte_idx = idx if offset_in_bytes else idx * _ld_arith.index(elem_size)
+    i32_vec = buffer_ops.global_load_dwords(
+        base_ptr, byte_idx, vec_width=vec_width, cache_modifier=cache_modifier
+    )
+    return vector.bitcast(T.vec(int(vec_elems), elem_type), i32_vec)
+
+
 @dataclass(frozen=True)
 class PreshuffleScaleLayout:
     """Container returned by `make_preshuffle_scale_layout`.
@@ -1118,7 +1150,7 @@ def load_b_raw_mxfp4_dwordx4(
     vector,
     *,
     arg_b,
-    b_rsrc,
+    b_rsrc=None,
     layout_b,
     base_k: ir.Value,
     n_blk: ir.Value,
@@ -1127,24 +1159,42 @@ def load_b_raw_mxfp4_dwordx4(
     elem_type: ir.Type,
     kpack_bytes: int = 16,
     cache_modifier: int = 0,
+    base_ptr=None,
 ):
-    """Load 16 bytes (vec4_i32) of packed FP4 via buffer_load_dwordx4.
+    """Load 16 bytes (vec4_i32) of packed FP4.
 
     CK-style addressing: klane = lane_div_16, loading the full kpack
     for the thread's sub-lane. Returns vec4_i32 where i32[j] contains
     8 FP4 elements for kIter j.
 
     Layout: ``(n0, k0, klane=4, nlane=16, kpack=16)``
+
+    Pass ``b_rsrc`` for the buffer path (``buffer_load_dwordx4``), or ``base_ptr``
+    for the raw-pointer path (``global_load_dwordx4``). The latter exists for a B
+    tensor larger than 4 GB: the buffer path's 32-bit voffset -- and the i32
+    coordinate math feeding it -- both truncate once ``n_blk`` carries an expert
+    offset that far out. See ``buffer_ops.global_load_dwords`` for what the
+    raw-pointer path gives up (hardware bounds checking).
     """
     if kpack_bytes != 16:
         raise ValueError(f"MXFP4 requires kpack_bytes=16, got {kpack_bytes!r}")
+    if (b_rsrc is None) == (base_ptr is None):
+        raise ValueError("pass exactly one of b_rsrc (buffer) or base_ptr (raw pointer)")
 
     c128 = arith.constant(128, index=True)
     k0 = base_k // c128
 
     coord_pack = (n_blk, k0, lane_div_16, n_intra, arith.constant(0, index=True))
-    idx_pack = crd2idx(tuple(fx.Int32(c) for c in coord_pack), layout_b)
 
+    if base_ptr is not None:
+        # i64 coords: the byte offset a >4 GB B tensor produces overflows inside
+        # crd2idx itself with i32 coords, before any address is even formed.
+        idx_pack = crd2idx(tuple(fx.Int64(c) for c in coord_pack), layout_b)
+        return buffer_ops.global_load_dwords(
+            base_ptr, idx_pack, vec_width=4, cache_modifier=cache_modifier
+        )
+
+    idx_pack = crd2idx(tuple(fx.Int32(c) for c in coord_pack), layout_b)
     b16 = _buffer_load_vec(
         buffer_ops,
         vector,
@@ -1154,6 +1204,7 @@ def load_b_raw_mxfp4_dwordx4(
         vec_elems=16,
         elem_bytes=1,
         offset_in_bytes=True,
+        cache_modifier=cache_modifier,
     )
     return vector.bitcast(T.vec(4, T.i32), b16)
 
