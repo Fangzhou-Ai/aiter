@@ -425,19 +425,34 @@ void partial_kernel(kargs args)
                 const int shift = args.qlen - 1 - qpos;
 
                 float local_max = LOWEST;
+                // Only the tail tile can be masked, but maybe_mask was a plain
+                // runtime scalar, so the per-element select was emitted on
+                // every tile: ATT charged 64 v_cndmask 2.2% of the kernel for
+                // work that matters on 1 tile in ~49.  Peel it onto a
+                // compile-time flag so the common path has no kv_pos, no
+                // compare, no select and no store-back.
+                auto scan = [&]<bool MASK>() {
 #pragma unroll
-                for(int a = 0; a < T::N_TILES; ++a)
+                    for(int a = 0; a < T::N_TILES; ++a)
 #pragma unroll
-                    for(int b = 0; b < 4; ++b)
-                    {
-                        float s = scores[qs][a * 4 + b];
-                        const int kv_pos =
-                            tile_global + 16 * a + 4 * g + b;
-                        if(maybe_mask && kv_pos + shift >= full_len)
-                            s = LOWEST;
-                        scores[qs][a * 4 + b] = s;
-                        local_max = max(local_max, s);
-                    }
+                        for(int b = 0; b < 4; ++b)
+                        {
+                            float s = scores[qs][a * 4 + b];
+                            if constexpr(MASK)
+                            {
+                                const int kv_pos =
+                                    tile_global + 16 * a + 4 * g + b;
+                                if(kv_pos + shift >= full_len)
+                                    s = LOWEST;
+                                scores[qs][a * 4 + b] = s;
+                            }
+                            local_max = max(local_max, s);
+                        }
+                };
+                if(maybe_mask)
+                    scan.template operator()<true>();
+                else
+                    scan.template operator()<false>();
 
                 const float row_max =
                     reduce_max_groups(local_max)
@@ -449,6 +464,13 @@ void partial_kernel(kargs args)
                 m_row[qs] = new_m;
                 bias[qs] = -m_ref[qs];
                 dexp[qs] = (int)(new_m - m_ref[qs]);
+                // P is scaled by 2^(7-dexp) to land in e4m3's range.  Folding
+                // that into exp2's addend costs nothing -- it is already an fma
+                // operand -- and removes one v_ldexp_f32 per score element.
+                // dexp is exact (new_m and m_ref are both floored), so this is
+                // an identity, not an approximation.  local_sum then carries
+                // the factor and is unscaled once per row instead of 32 times.
+                const float pbias = bias[qs] + (float)(7 - dexp[qs]);
 
                 float local_sum = 0.f;
                 i32x8 packed;
@@ -463,16 +485,16 @@ void partial_kernel(kargs args)
                             __builtin_fmaf(
                                 scores[qs][a * 4 + b],
                                 args.qk_scale_log2,
-                                bias[qs]));
+                                pbias));
                         local_sum += p;
-                        p4[b] = __builtin_ldexpf(
-                            p, 7 - dexp[qs]);
+                        p4[b] = p;
                     }
                     packed[a] = __builtin_bit_cast(
                         int, cast<fp8_t>(p4));
                 }
                 v_p[qs] = packed;
-                l_row[qs] += reduce_sum_groups(local_sum);
+                l_row[qs] += __builtin_ldexpf(
+                    reduce_sum_groups(local_sum), dexp[qs] - 7);
             }
 
             s_waitcnt_lgkmcnt(0_I);
