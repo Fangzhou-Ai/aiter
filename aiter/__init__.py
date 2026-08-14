@@ -122,6 +122,10 @@ else:
     from .ops.topk_plain import topk_plain  # noqa: F401
     from .ops.mha import *
     from .ops.vsa_sparse_attention import vsa_sparse_attention  # noqa: F401
+    from .ops.kimi_k3_mla import (  # noqa: F401
+        dspark_draft_mla_decode,
+        kimi_k3_verify_mla_decode,
+    )
     from .ops.gradlib import *
     from .ops.trans_ragged_layout import *
     from .ops.sample import *
