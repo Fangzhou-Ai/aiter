@@ -1,4 +1,13 @@
 {
+    "module_kimi_k3_mla": {
+        "srcs": ["f'{AITER_CSRC_DIR}/py_itfs_cu/kimi_k3_mla.cu'"],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "md_name": "'module_kimi_k3_mla'",
+        "extra_ldflags": "None",
+        "extra_include": ["f'{AITER_CSRC_DIR}/include'"],
+        "verbose": "False"
+    },
     "module_aiter_core": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/aiter_core_pybind.cu'"
