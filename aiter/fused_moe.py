@@ -451,6 +451,18 @@ def get_inter_dim(w1_shape, w2_shape):
     return E, model_dim, inter_dim
 
 
+def _get_tuning_topk(
+    topk: int,
+    *,
+    is_ep: bool,
+    has_fake_expert_slot: bool | None,
+) -> int:
+    """Return the routed top-k used to look up a tuned kernel config."""
+    if has_fake_expert_slot is None:
+        has_fake_expert_slot = is_ep
+    return topk - int(has_fake_expert_slot)
+
+
 def fused_moe(
     hidden_states,
     w1,  # [expert(local_expert:EP), inter_dim*2, dim] N,K
@@ -486,7 +498,11 @@ def fused_moe(
     shared_w1_scale: torch.Tensor | None = None,
     shared_w2_scale: torch.Tensor | None = None,
     shared_expert_id: int = -1,
+    has_fake_expert_slot: bool | None = None,
 ):
+    is_ep = expert_mask is not None
+    if has_fake_expert_slot is None:
+        has_fake_expert_slot = is_ep
     if (
         any(
             tensor is not None
@@ -554,6 +570,7 @@ def fused_moe(
         beta=beta,
         linear_beta=linear_beta,
         gate_mode=gate_mode,
+        has_fake_expert_slot=has_fake_expert_slot,
     )
 
 
@@ -585,6 +602,7 @@ def fused_moe_fake(
     beta: float | None = None,
     linear_beta: float | None = None,
     gate_mode: str = GateMode.SEPARATED.value,
+    has_fake_expert_slot: bool | None = None,
 ) -> torch.Tensor:
     device = topk_ids.device
     M, _topk = topk_ids.shape
@@ -623,6 +641,7 @@ def fused_moe_(
     beta: float | None = None,
     linear_beta: float | None = None,
     gate_mode: str = GateMode.SEPARATED.value,
+    has_fake_expert_slot: bool | None = None,
 ) -> torch.Tensor:
     return _fused_moe_impl(
         hidden_states=hidden_states,
@@ -650,6 +669,7 @@ def fused_moe_(
         beta=beta,
         linear_beta=linear_beta,
         gate_mode=gate_mode,
+        has_fake_expert_slot=has_fake_expert_slot,
     )
 
 
@@ -679,6 +699,7 @@ def _fused_moe_impl(
     beta: float | None = None,
     linear_beta: float | None = None,
     gate_mode: str = GateMode.SEPARATED.value,
+    has_fake_expert_slot: bool | None = None,
     *,
     _q_dtype_a: torch.dtype | None = None,
     _metadata_transform: Callable | None = None,
@@ -691,6 +712,9 @@ def _fused_moe_impl(
     gate_mode = GateMode(gate_mode)
     if block_size_M == -1:
         block_size_M = None
+    is_ep = expert_mask is not None
+    if has_fake_expert_slot is None:
+        has_fake_expert_slot = is_ep
     """user API"""
     M, topk = topk_ids.shape
     E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
@@ -851,7 +875,8 @@ def _fused_moe_impl(
         intermediate_pad,
         isShuffled,
         gate_mode,
-        is_ep=expert_mask is not None,
+        is_ep=is_ep,
+        has_fake_expert_slot=has_fake_expert_slot,
         has_stage2_bias=bias2 is not None,
         opus_weights_shuffled=getattr(w1, "is_shuffled", False)
         and getattr(w2, "is_shuffled", False),
@@ -1012,6 +1037,7 @@ def _fused_moe_impl(
             _metadata_transform=_metadata_transform,
             _stage1_extra_args=_stage1_extra_args,
             _stage2_extra_args=_stage2_extra_args,
+            has_fake_expert_slot=has_fake_expert_slot,
         )
 
 
@@ -2129,6 +2155,7 @@ def get_2stage_cfgs(
     is_ep=False,
     has_stage2_bias=False,
     opus_weights_shuffled=None,
+    has_fake_expert_slot=None,
 ):
     gate_mode = GateMode(gate_mode)
     # Configs are keyed on (gfx, cu_num, ...) so archs that share a cu_num
@@ -2209,10 +2236,14 @@ def get_2stage_cfgs(
         cfg_2stages = get_cfg_2stages(tune_file)
     cu_num = get_cu_num()
     gfx = get_gfx_runtime()
-    # EP convention: callers append one always-masked fake-expert slot to
-    # topk_ids, so runtime `topk` is routed_topk + 1. Tuned configs are keyed
-    # on routed_topk; strip the fake slot before building the lookup key.
-    topk -= int(is_ep)
+    # Tuned configs are keyed on routed top-k, excluding any always-masked
+    # fake-expert slot appended by the caller. ``None`` preserves the legacy
+    # convention that every EP input has one such slot.
+    topk = _get_tuning_topk(
+        topk,
+        is_ep=is_ep,
+        has_fake_expert_slot=has_fake_expert_slot,
+    )
     keys = (
         gfx,
         cu_num,
@@ -2983,9 +3014,13 @@ def fused_moe_2stages(
     _metadata_transform: Callable | None = None,
     _stage1_extra_args: dict | None = None,
     _stage2_extra_args: dict | None = None,
+    has_fake_expert_slot: bool | None = None,
 ):
     quant_func = get_quant(quant_type)
     gate_mode = GateMode(gate_mode)
+    is_ep = expert_mask is not None
+    if has_fake_expert_slot is None:
+        has_fake_expert_slot = is_ep
     token_num, _ = hidden_states.shape
     E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
     dtype = moe_out.dtype
@@ -3011,7 +3046,8 @@ def fused_moe_2stages(
         intermediate_pad,
         is_shuffled,
         gate_mode,
-        is_ep=expert_mask is not None,
+        is_ep=is_ep,
+        has_fake_expert_slot=has_fake_expert_slot,
         has_stage2_bias=bias2 is not None,
         opus_weights_shuffled=getattr(w1, "is_shuffled", False)
         and getattr(w2, "is_shuffled", False),
