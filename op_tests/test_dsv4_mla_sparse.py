@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""dsv4_mla_prefill reads the paged KV cache exactly as it was written.
+"""dsv4_mla_sparse reads the paged KV cache exactly as it was written.
 
 The kernel requantises each staged tile in LDS and takes its softmax frame from
 that tile, so no pass has to rewrite the cache to one exponent per token first.
@@ -15,7 +15,7 @@ import math
 import pytest
 import torch
 
-from aiter.ops.dsv4_mla_prefill import dsv4_mla_prefill
+from aiter.ops.dsv4_mla_sparse import dsv4_mla_sparse
 
 _D_NOPE, _D_ROPE = 448, 64
 _ROW, _NBLK = 576, 7
@@ -112,7 +112,12 @@ class _Pool:
         return out
 
 
-def _run(pool: _Pool, n_prefix: int, n_extend: int = 0, seed: int = 7):
+def _run(
+    pool: _Pool,
+    n_prefix: int,
+    n_extend: int = 0,
+    seed: int = 7,
+):
     """Call the kernel and the torch reference on the same random query set."""
     n_tok, n_head = 512, 128
     g = torch.Generator(device=_DEV).manual_seed(seed)
@@ -143,7 +148,7 @@ def _run(pool: _Pool, n_prefix: int, n_extend: int = 0, seed: int = 7):
 
     nope, rope = pool.views()
     max_e = torch.zeros(1, dtype=torch.int32, device=_DEV)
-    out = dsv4_mla_prefill(
+    out = dsv4_mla_sparse(
         q_nope=q_nope, q_rope=q_rope,
         unified_kv_nope=nope, unified_kv_rope=rope,
         kv_indices_prefix=ix_p, kv_indptr_prefix=ip_p,
@@ -179,7 +184,7 @@ def _run(pool: _Pool, n_prefix: int, n_extend: int = 0, seed: int = 7):
     return ((a - b).norm(dim=1) / b.norm(dim=1).clamp(min=1e-30)).median().item()
 
 
-# fp8 e4m3 on both GEMMs; 6% is the quantisation floor, not a tuned threshold
+# Relative-error tolerance for the dual-FP8 GEMMs.
 _TOL = 0.06
 
 
