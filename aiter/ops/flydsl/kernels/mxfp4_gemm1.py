@@ -212,7 +212,12 @@ def _gemm1_body(
             _global_i32_buffer_view(addr_i64, num_bytes), fx.make_layout(tile_elems, 1)
         )
 
-    bq_tiles = _global_i32_buffer_tiles(arg_bq, BQ_BYTES, 4)
+    # Keep the expert offset in the 64-bit base address, outside the 32-bit
+    # buffer offsets. Bounds remain local to this expert.
+    BQ_PER_EXPERT = BQ_BYTES // NE
+    bq_tiles = _global_i32_buffer_tiles(
+        arg_bq + fx.Int64(e) * fx.Int64(BQ_PER_EXPERT), BQ_PER_EXPERT, 4
+    )
     bq_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(b_aux), fx.Int32)
     bq_reg_lay = fx.make_layout(4, 1)
 
@@ -264,7 +269,8 @@ def _gemm1_body(
             g = tile_il & fx.Int32(1)
             n0 = tile_il >> fx.Int32(1)
             col = (g * fx.Int32(N0_HALF) + n0) * fx.Int32(16)
-        v = (e * fx.Int32(N_OUT) + col) * fx.Int32(K_HALF)
+        # expert-relative: bq_tiles is already re-based to this expert
+        v = col * fx.Int32(K_HALF)
         b_load_s_base.append(rocdl.readfirstlane(T.i32, v))
 
     # -- b_scale_s_base / _hi (HIP 418-429) -----------------------------------
