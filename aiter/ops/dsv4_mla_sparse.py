@@ -1,21 +1,18 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""DeepSeek-V4 MLA sparse prefill, served from a prebuilt code object.
+"""DeepSeek-V4 sparse MLA attention, served from a prebuilt code object.
 
-Same four kernels and the same validation as the JIT ops in
-``aiter/ops/pa_sparse_prefill_opus.py``, but the device code is compiled ahead
-of time into ``hsa/gfx950/dsv4_mla_prefill/dsv4_mla_prefill.co``.  The
-first call therefore costs no compile, and -- the reason this exists -- the
-attention kernel's schedule is fixed at ship time.  It sits at 504 of 512
-ArchVGPRs with zero scratch, so a toolchain that costs it eight registers spills
-the inner loop with no diagnostic.
+Serves both phases.  A decode step is the same operation with a much smaller N
+-- N query rows, each gathering its own index list plus its own sliding window
+out of the same pool -- so all 64 of its attention layers go through this op
+too, and there is no second kernel for them.  The op was called
+``dsv4_mla_prefill`` until that stopped being true of half its traffic.
 
-The attention op is ``dsv4_mla_prefill``; the JIT module spells the same kernel
-``pa_sparse_prefill_fp8_h40_opus``.  The three helpers keep their JIT names --
-``pa_fp8_q_pack`` -- because
-they are not prefill and a caller has no reason to care which build produced
-them.  That does mean the two modules must not both be imported:
-``aiter/__init__`` would bind whichever ran last for those three.  Pick one.
+The device code is compiled ahead of time under
+``hsa/gfx950/dsv4_mla_sparse/``.  The first call therefore costs no device
+compile, and the attention schedule is fixed at ship time.  It uses the full
+register budget with zero scratch, and its ISA is checked to contain no
+``v_accvgpr_read/write/mov`` instructions.
 
 Requires gfx950 and ``H >= PA_FP8_MIN_H``; the block is 128 heads wide and narrower shapes
 are rejected rather than run slowly.  See the JIT module for the full argument
@@ -28,22 +25,59 @@ from ..jit.core import compile_ops
 from ..jit.utils.chip_info import get_gfx_runtime
 from ..jit.utils.torch_guard import torch_compile_guard
 
-_MODULE = "module_dsv4_mla_prefill"
+_MODULE = "module_dsv4_mla_sparse"
 
 # Part of the op's contract rather than of this build, so these keep the names
 # the JIT module exports -- vLLM reads both to decide admission. Keep MIN_H in
-# sync with PA_FP8_H40_MIN_H in the kernel header, which is where the
+# sync with PA_SPARSE_MLA_MIN_H in the kernel header, which is where the
 # admission threshold is actually compiled in.
 PA_FP8_MIN_H = 16
 PA_FP8_GLOBAL64 = True
+# Whether this build takes the optional `row_map` argument.  A caller reads it
+# instead of probing the signature: a keyword the op does not have fails at
+# *call* time, which under cudagraphs is the worst place to find out.
+PA_FP8_HAS_ROW_MAP = True
 
 
-@compile_ops(_MODULE, fc_name="dsv4_mla_q_pack_fwd", ffi_type="ctypes")
-def _q_pack(q_nope_bf16: torch.Tensor, out: torch.Tensor) -> int: ...
+@compile_ops(_MODULE, fc_name="dsv4_mla_xcc_count", ffi_type="ctypes")
+def _xcc_count(device_id: int) -> int: ...
 
 
-@compile_ops(_MODULE, fc_name="dsv4_mla_prefill_fwd", ffi_type="ctypes")
-def _h40_prefill(
+_XCC: dict[int, int] = {}
+
+
+def xcc_count(device_id: int = 0) -> int:
+    """XCCs on the device, in its *current* compute partition.
+
+    A caller placing work by XCC needs this divisor, and both ways of getting it
+    without asking here are worse: torch does not surface it, and reaching
+    libamdhip64 by ctypes means writing hipDeviceAttributeNumberOfXccs' numeric
+    value into Python, where it is a worse constant than the one it replaces --
+    it moves with the ROCm version.  Here the compiler resolves the enum against
+    the headers this was built with.
+
+    The partition is set out of band (amd-smi), so this describes how the device
+    is configured right now, not the chip -- which is the reason a caller should
+    not spell it as a literal.  Cached per device: a partition cannot change
+    under a live context.
+
+    Raises RuntimeError rather than returning a fallback: a caller that silently
+    used the wrong divisor would build a permutation that is still valid (so
+    nothing fails) and simply stops placing anything, which is invisible.
+    """
+    cached = _XCC.get(device_id)
+    if cached is None:
+        got = int(_xcc_count(int(device_id)))
+        if got <= 0:
+            raise RuntimeError(
+                f"could not read the XCC count for device {device_id} (rc={got})"
+            )
+        _XCC[device_id] = cached = got
+    return cached
+
+
+@compile_ops(_MODULE, fc_name="dsv4_mla_sparse_fwd", ffi_type="ctypes")
+def _sparse_mla(
     q_nope: torch.Tensor,
     q_rope: torch.Tensor,
     unified_kv_nope: torch.Tensor,
@@ -68,6 +102,7 @@ def _h40_prefill(
     page_shift_extend: int,
     rows_per_page_extend: int,
     scale_off_extend: int,
+    row_map: torch.Tensor,
 ) -> int: ...
 
 
@@ -82,22 +117,7 @@ def _require_gfx950(op: str) -> None:
         raise RuntimeError(f"{op} requires gfx950, got {gfx}")
 
 
-def _q_pack_fake(q_nope_bf16: torch.Tensor, out: torch.Tensor) -> None:
-    return None
-
-
-@torch_compile_guard(mutates_args=["out"], gen_fake=_q_pack_fake)
-def pa_fp8_q_pack(q_nope_bf16: torch.Tensor, out: torch.Tensor) -> None:
-    """Pack ``[..., 448]`` bf16 Q into the ``[..., 512]`` fp8 + E8M0 layout.
-
-    The prefill kernel packs Q in its own prologue, so this is only for callers
-    that want the packed buffer for something else.
-    """
-    _require_gfx950("pa_fp8_q_pack")
-    _q_pack(q_nope_bf16, out)
-
-
-def _h40_fake(
+def _sparse_mla_fake(
     q_nope: torch.Tensor,
     q_rope: torch.Tensor,
     unified_kv_nope: torch.Tensor,
@@ -122,6 +142,7 @@ def _h40_fake(
     page_shift_extend: int = 0,
     rows_per_page_extend: int = 1,
     scale_off_extend: int = 448,
+    row_map: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if out is not None:
         return out
@@ -129,8 +150,8 @@ def _h40_fake(
     return torch.empty(n, h, 512, dtype=torch.bfloat16, device=q_nope.device)
 
 
-@torch_compile_guard(mutates_args=["out"], gen_fake=_h40_fake)
-def dsv4_mla_prefill(
+@torch_compile_guard(mutates_args=["out"], gen_fake=_sparse_mla_fake)
+def dsv4_mla_sparse(
     q_nope: torch.Tensor,
     q_rope: torch.Tensor,
     unified_kv_nope: torch.Tensor,
@@ -155,16 +176,18 @@ def dsv4_mla_prefill(
     page_shift_extend: int = 0,
     rows_per_page_extend: int = 1,
     scale_off_extend: int = 448,
+    row_map: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """DeepSeek-V4 h40 sparse prefill attention, both GEMMs on fp8.
+    """DeepSeek-V4 sparse MLA attention, both GEMMs on fp8.
 
     The KV cache is read exactly as it was written: the kernel requantises each
     staged tile in LDS and takes its softmax frame from that tile, so no pass
     has to flatten the seven block-64 scales a page stores per token.
     ``kv_max_e`` is kept for call compatibility and is ignored; pass a zeroed
     int32 device scalar.
+
     """
-    _require_gfx950("dsv4_mla_prefill")
+    _require_gfx950("dsv4_mla_sparse")
     if out is None:
         out = torch.empty(
             q_nope.shape[0],
@@ -173,7 +196,7 @@ def dsv4_mla_prefill(
             dtype=torch.bfloat16,
             device=q_nope.device,
         )
-    _h40_prefill(
+    _sparse_mla(
         q_nope,
         q_rope,
         unified_kv_nope,
@@ -198,5 +221,6 @@ def dsv4_mla_prefill(
         page_shift_extend,
         rows_per_page_extend,
         scale_off_extend,
+        _empty_i32(q_nope) if row_map is None else row_map,
     )
     return out

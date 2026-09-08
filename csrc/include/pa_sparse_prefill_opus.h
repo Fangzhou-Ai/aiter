@@ -205,7 +205,7 @@ struct pa_fp8_page_grid
 //    kernel quantises it in its prologue, one E8M0 per head.
 //  * the KV streams are addressed through a page grid, and the per-token E8M0
 //    scales live out of line in each page's tail rather than inside the row.
-//    `page_shift == 0` is rejected by the launcher -- unlike the h40 kernel,
+//    `page_shift == 0` is rejected by the launcher -- unlike the sparse MLA kernel,
 //    the flat layout is *not* a degenerate parameterisation of this one,
 //    because flat rows carry 14 per-32 exponents inline while a page tail
 //    carries 7 per-64 ones.
@@ -4041,7 +4041,7 @@ __device__ inline void pa_prefill_16mx8_32nx1_fp8_body(KArgs kargs) {
     // either -- an in-register per-32 pack would have to reproduce that
     // partition exactly.  Replicating one byte into all four slots of the scale
     // dword makes op_sel select the same value whatever it picks, which
-    // sidesteps the question.  Measured accuracy-neutral on the h40 kernel out
+    // sidesteps the question.  Measured accuracy-neutral on the sparse MLA kernel out
     // to 25 octaves of forced within-head spread: elements that far below the
     // head max contribute less than the fp8 mantissa of the dominant terms.
     vector_t<D_NOPE, T::Q_TILE_SIZE * T::D_NOPE_PADDED_SIZE / T::WARP_SIZE> v_q_nope;
@@ -4109,7 +4109,7 @@ __device__ inline void pa_prefill_16mx8_32nx1_fp8_body(KArgs kargs) {
         //
         // QDIV = 64 leaves 7x of headroom against e4m3's 448, and that headroom
         // is load-bearing rather than decorative.  With QDIV = 256 -- 1.75x, the
-        // margin the algebra says is enough, and what the equivalent h40 pack
+        // margin the algebra says is enough, and what the equivalent sparse MLA pack
         // runs with -- 3% of rows came back NaN.  Bisected: the reduction is not
         // at fault (three independent implementations, including __shfl_xor and
         // an explicit four-lane gather, give bit-identical results), and a host

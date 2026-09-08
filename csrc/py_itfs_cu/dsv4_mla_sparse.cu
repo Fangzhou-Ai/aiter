@@ -1,60 +1,23 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// Prebuilt-code-object entry points for the DeepSeek-V4 MLA sparse prefill
-// kernels (the "h40" fp8 prefill family).
+// Prebuilt-code-object entry points for the DeepSeek-V4 sparse MLA attention
+// kernels (the fp8 sparse MLA family).
 //
-// The device code is compiled ahead of time into
-// hsa/gfx950/dsv4_mla_prefill/dsv4_mla_prefill.co from the kernel headers under
-// csrc/include, so nothing here JIT-compiles a kernel: only this loader is built,
-// and the attention kernel's schedule is fixed at ship time rather than left to
-// whatever clang the deployment image happens to carry.  That matters for this
-// kernel in particular -- it sits at 504 of 512 ArchVGPRs with zero scratch, so
-// a compiler that costs it eight registers spills the inner loop.
+// The device code is compiled ahead of time under
+// hsa/gfx950/dsv4_mla_sparse/ from the kernel headers under csrc/include.
+// Nothing here JIT-compiles a device kernel: only this loader is built, and the
+// attention schedule is fixed at ship time.  The kernel consumes the full
+// register budget with zero scratch, so a small allocation change can spill
+// the inner loop.
 //
 // What stays here is the half a code object cannot hold: argument validation,
 // the layout descriptor, and the launch geometry.  Those bodies are carried
 // over verbatim from the JIT launcher (csrc/py_itfs_cu/
 // pa_sparse_prefill_opus_kernels.cu); only the <<<>>> became launch_kernel.
 //
-// How the shipped object was built, so a rebuild can be compared against it:
-//
-//   hipcc -O3 -std=c++20 --offload-arch=gfx950 -I csrc/include
-//         -DWITH_HIP -D_GLIBCXX_USE_CXX11_ABI=1 -DENABLE_CK=1
-//         -DENABLE_ROPE_POSITIONS_INT32=0 -D__HIP_PLATFORM_AMD__=1
-//         -D__HIP_PLATFORM_HCC__=1 -DUSE_ROCM=1 -DHIPBLAS_V2 -DCUDA_HAS_FP16=1
-//         -DLEGACY_HIPBLAS_DIRECT -DUSE_PROF_API=1
-//         -ffast-math -fgpu-flush-denormals-to-zero -fno-offload-uniform-block
-//         -fno-gpu-rdc -mcmodel=large -fno-unique-section-names
-//         -ffunction-sections -fdata-sections -fvisibility=hidden
-//         -fvisibility-inlines-hidden -fPIC
-//         -mllvm --amdgpu-kernarg-preload-count=32
-//         -mllvm --lsr-drop-solution=1
-//         -mllvm -amdgpu-early-inline-all=false
-//         -mllvm -amdgpu-function-calls=false
-//         -mllvm -enable-post-misched=1
-//         -c -x hip <TU including pa_sparse_prefill_fp8_h40.h>
-//
-// then llvm-objcopy --dump-section=.hip_fatbin and clang-offload-bundler
-// --unbundle --targets=hipv4-amdgcn-amd-amdhsa--gfx950: hipModuleLoad wants a
-// bare ELF, and a bundled object builds fine and fails at load time.
-//
-// These are aiter's own JIT flags for module_pa_sparse_prefill_opus, minus the
-// torch include paths a device TU does not use.  Two are load-bearing and
-// neither is obvious, because both are read wrong from the obvious place:
-//
-//   -enable-post-misched=1        the generated build.ninja carries =0 and then
-//                                 =1.  The later wins; the kernel is 5-9%
-//                                 slower with the =0 a casual reading gives.
-//   -amdgpu-early-inline-all=false  the ninja *rule* appends this after
-//                                 cuda_cflags' =true.  Reading cuda_cflags
-//                                 alone gets =true and a different register
-//                                 allocation.
-//
-// Verify a rebuild rather than trusting it: llvm-objdump -d --mcpu=gfx950, and
-// both kernels must match instruction for instruction.  Compare the
-// disassembly, not the hash -- two builds of the same source at different paths
-// differ in .dynstr, because __hip_cuid_ follows the path.
+// The shipped files are bare gfx950 ELFs built from pa_sparse_mla_fp8.h with
+// pinned compiler scheduling flags.
 
 #include "aiter_hip_common.h"
 #include "aiter_tensor.h"
@@ -63,14 +26,14 @@
 #include <cstddef>
 #include <exception>
 
-// Mirrors PA_FP8_H40_MIN_H in the kernel header: the code object was built
+// Mirrors PA_SPARSE_MLA_MIN_H in the kernel header: the code object was built
 // with that threshold, and this loader does not include the header.
 #define PA_FP8_MIN_H 16
 
 namespace {
 
 // ---------------------------------------------------------------------------
-// Mirrors pa_fp8_h40::pa_fp8_kargs.  The loader deliberately does not include
+// Mirrors pa_sparse_mla::pa_fp8_kargs.  The loader deliberately does not include
 // the kernel header: the whole point of shipping a code object is that the
 // device source is not compiled here.  The static_asserts are the guard -- the
 // .co's kernarg_segment_size is 208, and a field reordered on either side would
@@ -113,30 +76,21 @@ struct PaFp8Kargs
     int kv_stride_q_extend;
     float softmax_scale;
     const int* max_e_ptr;
+    // Optional permutation of query rows over the grid; null keeps the default
+    // reverse order.  Appended last so every offset below is unchanged.
+    const int* row_map;
 };
-static_assert(sizeof(PaFp8Kargs) == 208, "kargs layout drifted from the .co");
+static_assert(sizeof(PaFp8Kargs) == 216, "kargs layout drifted from the .co");
+static_assert(offsetof(PaFp8Kargs, row_map) == 208, "kargs layout drifted");
 static_assert(offsetof(PaFp8Kargs, out_ptr) == 56, "kargs layout drifted");
 static_assert(offsetof(PaFp8Kargs, N) == 96, "kargs layout drifted");
 static_assert(offsetof(PaFp8Kargs, sgl_page_shift) == 144, "kargs layout drifted");
 static_assert(offsetof(PaFp8Kargs, softmax_scale) == 192, "kargs layout drifted");
 static_assert(offsetof(PaFp8Kargs, max_e_ptr) == 200, "kargs layout drifted");
 
-// The Q pack kernel takes loose parameters rather than one struct, so its
-// argument buffer is spelled out here the way HIP packs a kernarg segment:
-// natural alignment, no packing attribute.
-
-struct QPackArgs
-{
-    const void* src;      // const __bf16*
-    unsigned char* dst;
-    int rows;
-    int src_stride;
-};
-static_assert(sizeof(QPackArgs) == 24 && offsetof(QPackArgs, rows) == 16, "");
-
-constexpr int PA_FP8_H40_D_NOPE_PADDED = 512;  // 448 NoPE fp8 + 14 E8M0 + pad
-constexpr int PA_FP8_H40_D_ROPE        = 64;
-constexpr int PA_FP8_H40_D_HEAD        = 512;
+constexpr int PA_SPARSE_MLA_D_NOPE_PADDED = 512;  // 448 NoPE fp8 + 14 E8M0 + pad
+constexpr int PA_SPARSE_MLA_D_ROPE        = 64;
+constexpr int PA_SPARSE_MLA_D_HEAD        = 512;
 
 // pa_fp8_traits, fixed at the moment the code object was built.
 constexpr int HEADS_PER_BLOCK = 128;  // NUM_WARPS 4 * Q_SUB 2 * Q_TILE 16
@@ -144,56 +98,14 @@ constexpr int BLOCK_SIZE      = 256;  // NUM_WARPS 4 * WARP_SIZE 64
 
 constexpr int ceil_div(int a, int b) { return (a + b - 1) / b; }
 
-// C++ mangled names, taken from `llvm-nm dsv4_mla_prefill.co`.  There is
-// exactly one code object and the namespace is unique to it, so a symbol names
-// exactly one kernel.
-constexpr const char* CO_PATH = "/dsv4_mla_prefill/dsv4_mla_prefill.co";
-constexpr const char* SYM_PREFILL  = "_ZN10pa_fp8_h4021pa_prefill_fp8_kernelENS_12pa_fp8_kargsE";
-constexpr const char* SYM_Q_PACK   = "_ZN10pa_fp8_h4020pa_fp8_q_pack_kernelEPKDF16bPhii";
+// C++ mangled name taken from `llvm-nm dsv4_mla_sparse.co`.
+constexpr const char* CO_PATH = "/dsv4_mla_sparse/dsv4_mla_sparse.co";
+constexpr const char* SYM_KERNEL   = "_ZN13pa_sparse_mla20pa_sparse_mla_kernelENS_12pa_fp8_kargsE";
 
-// One instance per symbol, constructed on first use.  Construction is what
-// registers the code object.  This used to be forced at import time from a
-// warmup entry, on the assumption that registering during a stream capture is
-// illegal; measured on ROCm 7.2.4 and 7.14 it is not, and every other
-// AiterAsmKernel call site in csrc registers lazily too -- asm_mla.cu builds its
-// decode kernels this way, inside the path vLLM captures with cudagraphs.
-AiterAsmKernel& k_prefill()  { static AiterAsmKernel k(SYM_PREFILL,  CO_PATH); return k; }
-AiterAsmKernel& k_q_pack()   { static AiterAsmKernel k(SYM_Q_PACK,   CO_PATH); return k; }
+// Lazy code-object loader.
+AiterAsmKernel& k_sparse_mla()  { static AiterAsmKernel k(SYM_KERNEL,   CO_PATH); return k; }
 
-void pa_fp8_q_pack_impl(aiter_tensor_t& q_nope_bf16, aiter_tensor_t& out,
-                        hipStream_t stream)
-{
-    AITER_CHECK(q_nope_bf16.dtype() == AITER_DTYPE_bf16, "q_nope_bf16 must be bf16");
-    AITER_CHECK(out.dtype() == AITER_DTYPE_fp8, "out must be fp8");
-    AITER_CHECK(q_nope_bf16.dim() == out.dim(), "q and out must have the same rank");
-    const int last = q_nope_bf16.dim() - 1;
-    AITER_CHECK(static_cast<int>(q_nope_bf16.size(last)) == 448,
-                "q_nope_bf16 last dim must be 448 (DSv4 NoPE width)");
-    AITER_CHECK(static_cast<int>(out.size(last)) == 512, "out last dim must be 512");
-    AITER_CHECK(q_nope_bf16.stride(last) == 1 && out.stride(last) == 1,
-                "q and out must be contiguous along the head dim");
-    AITER_CHECK(out.is_contiguous(), "out must be contiguous");
-
-    int64_t rows = 1;
-    for(int i = 0; i < last; ++i)
-        rows *= q_nope_bf16.size(i);
-    if(rows == 0)
-        return;
-    const int src_stride = static_cast<int>(q_nope_bf16.stride(last - 1));
-
-    HipDeviceGuard guard(q_nope_bf16.device_id);
-    // 14 quant blocks + 50 pad-zeroing threads = 64
-    QPackArgs a{};
-    a.src        = q_nope_bf16.data_ptr();
-    a.dst        = reinterpret_cast<unsigned char*>(out.data_ptr());
-    a.rows       = static_cast<int>(rows);
-    a.src_stride = src_stride;
-    size_t sz = sizeof(a);
-    // 14 quant blocks + 50 pad-zeroing threads = 64
-    k_q_pack().launch_kernel({&a, &sz, static_cast<int>(rows), 1, 1, 64, 1, 1, stream});
-}
-
-void dsv4_mla_prefill_impl(aiter_tensor_t& q_nope,
+void dsv4_mla_sparse_impl(aiter_tensor_t& q_nope,
                                         aiter_tensor_t& q_rope,
                                         aiter_tensor_t& unified_kv_nope,
                                         aiter_tensor_t& unified_kv_rope,
@@ -217,11 +129,12 @@ void dsv4_mla_prefill_impl(aiter_tensor_t& q_nope,
                                         int page_shift_extend,
                                         int rows_per_page_extend,
                                         int scale_off_extend,
-                                         hipStream_t stream)
+                                        aiter_tensor_t& row_map,
+                                        hipStream_t stream)
 {
-    constexpr int D_NOPE_PADDED = PA_FP8_H40_D_NOPE_PADDED;
-    constexpr int D_ROPE        = PA_FP8_H40_D_ROPE;
-    constexpr int D_HEAD        = PA_FP8_H40_D_HEAD;
+    constexpr int D_NOPE_PADDED = PA_SPARSE_MLA_D_NOPE_PADDED;
+    constexpr int D_ROPE        = PA_SPARSE_MLA_D_ROPE;
+    constexpr int D_HEAD        = PA_SPARSE_MLA_D_HEAD;
 
     // ---- Shape / dtype validation -----------------------------------------
     AITER_CHECK(q_nope.dim() == 3, "q_nope must be 3-D [N, H, 448], got ndim=", q_nope.dim());
@@ -259,7 +172,7 @@ void dsv4_mla_prefill_impl(aiter_tensor_t& q_nope,
 
     // No narrow-head path on purpose -- see the note above this function.
     AITER_CHECK(H >= PA_FP8_MIN_H,
-                "dsv4_mla_prefill is only profitable for H >= ",
+                "dsv4_mla_sparse is only profitable for H >= ",
                 PA_FP8_MIN_H, " (the block is ", HEADS_PER_BLOCK,
                 " heads wide); got H=", H);
 
@@ -383,11 +296,27 @@ void dsv4_mla_prefill_impl(aiter_tensor_t& q_nope,
     kargs.kv_stride_q_prefix = kv_stride_q_prefix;
     kargs.kv_stride_q_extend = kv_stride_q_extend;
     kargs.softmax_scale       = softmax_scale;
-    // This build is bound to the flat KV layout (PA_SGLANG_PAGED 0), so a paged
-    // page grid would be read as if it were flat -- wrong results, not an error.
-    // Reject it instead; the layout arguments stay in the signature so a paged
-    // build is a recompile rather than an API change.
+    // Layout is chosen by the descriptor validated above, not by this build:
+    // the paged addressing is compiled in (PA_SGLANG_PAGED defaults to 1) and a
+    // flat caller passes (0, 1, 448), which the same path handles.
     kargs.max_e_ptr           = reinterpret_cast<const int*>(kv_max_e.data_ptr());
+    // Empty tensor means "no permutation", the same sentinel kv_lens_* uses.
+    if(row_map.numel() > 0)
+    {
+        // Exactly N, not at least: the kernel reads row_map[0..N-1] and the
+        // contract is that those are a permutation of [0, N).  A longer table
+        // satisfies ">=" while its first N entries are not a permutation --
+        // some rows would be computed twice and others never written, with no
+        // diagnostic.  The one caller keys its cache by the row count, so an
+        // exact length is what it already passes.
+        AITER_CHECK(row_map.numel() == N,
+                    "row_map must hold exactly N entries, a permutation of [0, N)");
+        kargs.row_map = reinterpret_cast<const int*>(row_map.data_ptr());
+    }
+    else
+    {
+        kargs.row_map = nullptr;
+    }
 
     // ---- Launch ----------------------------------------------------------
     HipDeviceGuard guard(q_nope.device_id);
@@ -396,10 +325,10 @@ void dsv4_mla_prefill_impl(aiter_tensor_t& q_nope,
     dim3 grid(N, num_h_blocks, 1);
     dim3 block(BLOCK_SIZE);
     size_t sz = sizeof(kargs);
-    k_prefill().launch_kernel({&kargs, &sz,
-                               N, num_h_blocks, 1,
-                               BLOCK_SIZE, 1, 1,
-                               stream});
+    k_sparse_mla().launch_kernel({&kargs, &sz,
+                                  N, num_h_blocks, 1,
+                                  BLOCK_SIZE, 1, 1,
+                                  stream});
 }
 
 } // namespace
@@ -411,22 +340,33 @@ AITER_CTYPES_ERROR_DEF
 // the module's TLS slot and returns -1; jit/core.py's ctypes binding picks it up
 // and raises RuntimeError with the original text, so the diagnostics survive.
 
-#define PA_H40_CO_ENTRY(call, name)                                               \
+#define PA_SPARSE_MLA_CO_ENTRY(call, name)                                               \
     return aiter_safe_call(g_aiter_last_error, [&] {                              \
         call;                                                                     \
         return 0;                                                                 \
     });
 
-AITER_C_ITFS int dsv4_mla_q_pack_fwd(aiter_tensor_t* q_nope_bf16,
-                                  aiter_tensor_t* out,
-                                  void* stream)
+// How many XCCs the device exposes *in its current compute partition*.  A
+// caller placing work by XCC needs this and cannot get it from torch, which
+// does not surface it; reaching into libamdhip64 by ctypes would mean writing
+// hipDeviceAttributeNumberOfXccs' numeric value into Python, where it is a
+// worse constant than the one it replaces -- it tracks the ROCm version.  Here
+// the enum is resolved by the compiler against the headers this was built
+// with.  Not specific to this op; it lives here because this is the only op
+// that has a caller for it.
+AITER_C_ITFS int dsv4_mla_xcc_count(int device_id)
 {
-    PA_H40_CO_ENTRY(pa_fp8_q_pack_impl(*q_nope_bf16, *out,
-                                       static_cast<hipStream_t>(stream)),
-                    "pa_fp8_q_pack")
+    // Returns the count, or a negative errno-ish value -- not the module's
+    // usual 0/-1 + TLS-message convention, because this is a pure query with
+    // nothing to marshal, and because torch's infer_schema (which compile_ops
+    // runs over the ctypes declaration) rejects a pointer out-parameter.
+    int n = 0;
+    if(hipDeviceGetAttribute(&n, hipDeviceAttributeNumberOfXccs, device_id) != hipSuccess)
+        return -1;
+    return n > 0 ? n : -2;
 }
 
-AITER_C_ITFS int dsv4_mla_prefill_fwd(aiter_tensor_t* q_nope,
+AITER_C_ITFS int dsv4_mla_sparse_fwd(aiter_tensor_t* q_nope,
                                                    aiter_tensor_t* q_rope,
                                                    aiter_tensor_t* unified_kv_nope,
                                                    aiter_tensor_t* unified_kv_rope,
@@ -450,10 +390,11 @@ AITER_C_ITFS int dsv4_mla_prefill_fwd(aiter_tensor_t* q_nope,
                                                    int64_t page_shift_extend,
                                                    int64_t rows_per_page_extend,
                                                    int64_t scale_off_extend,
+                                                   aiter_tensor_t* row_map,
                                                    void* stream)
 {
-    PA_H40_CO_ENTRY(
-        dsv4_mla_prefill_impl(
+    PA_SPARSE_MLA_CO_ENTRY(
+        dsv4_mla_sparse_impl(
             *q_nope, *q_rope, *unified_kv_nope, *unified_kv_rope,
             *kv_indices_prefix, *kv_indptr_prefix, *kv_nope, *kv_rope,
             *kv_indices_extend, *kv_indptr_extend, *attn_sink, *kv_max_e, *out,
@@ -465,6 +406,7 @@ AITER_C_ITFS int dsv4_mla_prefill_fwd(aiter_tensor_t* q_nope,
             static_cast<int>(page_shift_extend),
             static_cast<int>(rows_per_page_extend),
             static_cast<int>(scale_off_extend),
+            *row_map,
             static_cast<hipStream_t>(stream)),
-        "dsv4_mla_prefill")
+        "dsv4_mla_sparse")
 }
