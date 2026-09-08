@@ -938,7 +938,7 @@ __device__ void accumulate_segment(const pa_fp8_kargs& kargs,
                 "global_load_dwordx2 %3, %7, off\n\t"
                 // Inline VMEM outputs require an explicit drain before use.
                 "s_waitcnt vmcnt(0)"
-                : "=v"(e[0]), "=v"(e[1]), "=v"(e[2]), "=v"(e[3])
+                : "=&v"(e[0]), "=&v"(e[1]), "=&v"(e[2]), "=&v"(e[3])
                 : "v"(p0), "v"(p1), "v"(p2), "v"(p3)
                 : "memory");
         }
