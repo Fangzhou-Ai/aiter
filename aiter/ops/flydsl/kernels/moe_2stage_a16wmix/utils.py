@@ -386,7 +386,7 @@ class _BCol(NamedTuple):
     Only the scale fields of the active ``w_dtype`` are filled; the others stay None.
     """
 
-    n_blk: object  # 16-row weight block index (expert-indexed for mxfp4/int4)
+    n_blk: object  # 16-row weight block index (expert-indexed for int4)
     n_intra: object  # row within that block
     sc_blk: object = None  # mxfp4: 32-col e8m0 scale block index
     sc_pack: object = None  # mxfp4: N_Pack half selector (0/1) within that block
@@ -498,11 +498,10 @@ def make_b_loader(
     _g_half = (K // A16WI4_GROUP_SIZE) // 2
 
     # ---- buffer resources -----------------------------------------------------
-    # bf16 W [E, N_OUT, K] whole-tensor extent overflows the 32-bit num_records/i32
-    # byte-offset at large E (E896: 6.6GB): fold the per-expert base into the i64
-    # resource addr and index within the expert. mxfp4/int4 keep the whole-tensor path.
-    if const_expr(_is_bf16):
-        _w_per_expert_bytes = N_OUT * (K * 2)
+    # Keep MXFP4/BF16 buffers expert-relative: i64 coordinates alone cannot
+    # prevent BufferCopy's 32-bit offset truncation above 4 GiB.
+    if const_expr(not _is_int4):
+        _w_per_expert_bytes = N_OUT * (K * 2 if _is_bf16 else K_HALF)
         w_base_i64 = fx.Int64(arg_bq) + fx.Int64(e) * fx.Int64(_w_per_expert_bytes)
         w_tiles = _global_i32_buffer_tiles(
             w_base_i64, min(_w_per_expert_bytes, 0xFFFFFFFF), 4
@@ -572,8 +571,7 @@ def make_b_loader(
     def col(*n_terms):
         """Address one 16-wide N block; this lane owns row ``sum(n_terms) + lane``."""
         col_g = _sum(n_terms[0], n_terms[1:]) + lane_mod_16
-        # bf16 W folds the expert into the resource base (above); mxfp4/int4 index it.
-        _row_expert_off = fx.Int32(0) if const_expr(_is_bf16) else expert_off
+        _row_expert_off = expert_off if const_expr(_is_int4) else fx.Int32(0)
         row = _row_expert_off + col_g
         n_blk = row // fx.Int32(16)
         n_intra = row % fx.Int32(16)
@@ -583,7 +581,7 @@ def make_b_loader(
     def col_pair(*n_terms, shift):
         """Address a gate|up pair: one block, and the one ``shift`` further along N."""
         col_g = _sum(n_terms[0], n_terms[1:]) + lane_mod_16
-        _row_expert_off = fx.Int32(0) if const_expr(_is_bf16) else expert_off
+        _row_expert_off = expert_off if const_expr(_is_int4) else fx.Int32(0)
         row_g = _row_expert_off + col_g
         row_u = row_g + shift
         blk_g, intra_g = row_g // fx.Int32(16), row_g % fx.Int32(16)

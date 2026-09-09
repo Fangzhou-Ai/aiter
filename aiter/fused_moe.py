@@ -451,6 +451,18 @@ def get_inter_dim(w1_shape, w2_shape):
     return E, model_dim, inter_dim
 
 
+def _get_tuning_topk(
+    topk: int,
+    *,
+    is_ep: bool,
+    has_fake_expert_slot: bool | None,
+) -> int:
+    """Return the routed top-k used to look up a tuned kernel config."""
+    if has_fake_expert_slot is None:
+        has_fake_expert_slot = is_ep
+    return topk - int(has_fake_expert_slot)
+
+
 def fused_moe(
     hidden_states,
     w1,  # [expert(local_expert:EP), inter_dim*2, dim] N,K
@@ -486,7 +498,11 @@ def fused_moe(
     shared_w1_scale: torch.Tensor | None = None,
     shared_w2_scale: torch.Tensor | None = None,
     shared_expert_id: int = -1,
+    has_fake_expert_slot: bool | None = None,
 ):
+    is_ep = expert_mask is not None
+    if has_fake_expert_slot is None:
+        has_fake_expert_slot = is_ep
     if (
         any(
             tensor is not None
@@ -554,6 +570,7 @@ def fused_moe(
         beta=beta,
         linear_beta=linear_beta,
         gate_mode=gate_mode,
+        has_fake_expert_slot=has_fake_expert_slot,
     )
 
 
@@ -585,6 +602,7 @@ def fused_moe_fake(
     beta: float | None = None,
     linear_beta: float | None = None,
     gate_mode: str = GateMode.SEPARATED.value,
+    has_fake_expert_slot: bool | None = None,
 ) -> torch.Tensor:
     device = topk_ids.device
     M, _topk = topk_ids.shape
@@ -623,6 +641,7 @@ def fused_moe_(
     beta: float | None = None,
     linear_beta: float | None = None,
     gate_mode: str = GateMode.SEPARATED.value,
+    has_fake_expert_slot: bool | None = None,
 ) -> torch.Tensor:
     return _fused_moe_impl(
         hidden_states=hidden_states,
@@ -650,6 +669,7 @@ def fused_moe_(
         beta=beta,
         linear_beta=linear_beta,
         gate_mode=gate_mode,
+        has_fake_expert_slot=has_fake_expert_slot,
     )
 
 
@@ -679,6 +699,7 @@ def _fused_moe_impl(
     beta: float | None = None,
     linear_beta: float | None = None,
     gate_mode: str = GateMode.SEPARATED.value,
+    has_fake_expert_slot: bool | None = None,
     *,
     _q_dtype_a: torch.dtype | None = None,
     _metadata_transform: Callable | None = None,
@@ -691,6 +712,9 @@ def _fused_moe_impl(
     gate_mode = GateMode(gate_mode)
     if block_size_M == -1:
         block_size_M = None
+    is_ep = expert_mask is not None
+    if has_fake_expert_slot is None:
+        has_fake_expert_slot = is_ep
     """user API"""
     M, topk = topk_ids.shape
     E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
@@ -722,7 +746,53 @@ def _fused_moe_impl(
     ):
         q_dtype_a = dtypes.fp8
     bf16_fp8_bound = int(os.environ.get("AITER_BF16_FP8_MOE_BOUND", "256"))
-    if quant_type == QuantType.per_1x32 and q_dtype_w == dtypes.i4x2:
+    prequant_mxfp8 = (
+        quant_type == QuantType.per_1x32 and hidden_states.dtype == dtypes.fp8
+    )
+    prequant_mxfp4 = (
+        quant_type == QuantType.per_1x32 and hidden_states.dtype == dtypes.fp4x2
+    )
+    if prequant_mxfp8:
+        if a1_scale is None or a1_scale.dtype != dtypes.fp8_e8m0:
+            raise ValueError(
+                "pre-quantized MXFP8 input requires an E8M0 per-1x32 scale"
+            )
+        if get_gfx() != "gfx950":
+            raise NotImplementedError("pre-quantized MXFP8 input requires gfx950")
+        if q_dtype_w not in (dtypes.fp4x2, dtypes.fp8):
+            raise ValueError(
+                "pre-quantized MXFP8 input requires MXFP4 or MXFP8 weights"
+            )
+        if hidden_states.shape[1] % 32 != 0 or a1_scale.shape != (
+            hidden_states.shape[0],
+            hidden_states.shape[1] // 32,
+        ):
+            raise ValueError(
+                "pre-quantized MXFP8 input and scale have incompatible shapes"
+            )
+        if not hidden_states.is_contiguous() or not a1_scale.is_contiguous():
+            raise ValueError("pre-quantized MXFP8 input and scale must be contiguous")
+        q_dtype_a = dtypes.fp8
+    elif prequant_mxfp4:
+        if a1_scale is None or a1_scale.dtype != dtypes.fp8_e8m0:
+            raise ValueError(
+                "pre-quantized MXFP4 input requires an E8M0 per-1x32 scale"
+            )
+        if q_dtype_w != dtypes.fp4x2:
+            raise ValueError("pre-quantized MXFP4 input requires MXFP4 weights")
+        # FP4 packs two logical values into each stored byte.
+        logical_hidden = hidden_states.shape[1] * 2
+        if logical_hidden % 32 != 0 or a1_scale.shape != (
+            hidden_states.shape[0],
+            logical_hidden // 32,
+        ):
+            raise ValueError(
+                "pre-quantized MXFP4 input and scale have incompatible shapes"
+            )
+        if not hidden_states.is_contiguous() or not a1_scale.is_contiguous():
+            raise ValueError("pre-quantized MXFP4 input and scale must be contiguous")
+        q_dtype_a = dtypes.fp4x2
+    elif quant_type == QuantType.per_1x32 and q_dtype_w == dtypes.i4x2:
         # a16wi4: bf16 activations, int4 weights with groupwise scale
         q_dtype_a = dtypes.bf16
     elif quant_type == QuantType.per_1x32 and q_dtype_w == dtypes.fp8:
@@ -752,7 +822,7 @@ def _fused_moe_impl(
         else:
             q_dtype_a = dtypes.fp4x2
 
-    if get_gfx() == "gfx1250":
+    if get_gfx() == "gfx1250" and not (prequant_mxfp4 or prequant_mxfp8):
         if os.environ.get("AITER_FORCE_A8W4", "0") in ("1"):
             q_dtype_a = dtypes.fp8
         else:
@@ -851,7 +921,8 @@ def _fused_moe_impl(
         intermediate_pad,
         isShuffled,
         gate_mode,
-        is_ep=expert_mask is not None,
+        is_ep=is_ep,
+        has_fake_expert_slot=has_fake_expert_slot,
         has_stage2_bias=bias2 is not None,
         opus_weights_shuffled=getattr(w1, "is_shuffled", False)
         and getattr(w2, "is_shuffled", False),
@@ -859,6 +930,11 @@ def _fused_moe_impl(
 
     if _metadata_transform is not None:
         metadata = _metadata_transform(metadata)
+    if prequant_mxfp4 and not metadata.prequant:
+        raise NotImplementedError(
+            "pre-quantized MXFP4 input is not supported by the native "
+            "MXFP4 MoE path"
+        )
 
     block_size_M = metadata.block_m if block_size_M is None else block_size_M
     # Ensure block_size_M is int (metadata.block_m from CSV may be float)
@@ -1012,6 +1088,7 @@ def _fused_moe_impl(
             _metadata_transform=_metadata_transform,
             _stage1_extra_args=_stage1_extra_args,
             _stage2_extra_args=_stage2_extra_args,
+            has_fake_expert_slot=has_fake_expert_slot,
         )
 
 
@@ -2129,6 +2206,7 @@ def get_2stage_cfgs(
     is_ep=False,
     has_stage2_bias=False,
     opus_weights_shuffled=None,
+    has_fake_expert_slot=None,
 ):
     gate_mode = GateMode(gate_mode)
     # Configs are keyed on (gfx, cu_num, ...) so archs that share a cu_num
@@ -2209,10 +2287,14 @@ def get_2stage_cfgs(
         cfg_2stages = get_cfg_2stages(tune_file)
     cu_num = get_cu_num()
     gfx = get_gfx_runtime()
-    # EP convention: callers append one always-masked fake-expert slot to
-    # topk_ids, so runtime `topk` is routed_topk + 1. Tuned configs are keyed
-    # on routed_topk; strip the fake slot before building the lookup key.
-    topk -= int(is_ep)
+    # Tuned configs are keyed on routed top-k, excluding any always-masked
+    # fake-expert slot appended by the caller. ``None`` preserves the legacy
+    # convention that every EP input has one such slot.
+    topk = _get_tuning_topk(
+        topk,
+        is_ep=is_ep,
+        has_fake_expert_slot=has_fake_expert_slot,
+    )
     keys = (
         gfx,
         cu_num,
@@ -2983,9 +3065,13 @@ def fused_moe_2stages(
     _metadata_transform: Callable | None = None,
     _stage1_extra_args: dict | None = None,
     _stage2_extra_args: dict | None = None,
+    has_fake_expert_slot: bool | None = None,
 ):
     quant_func = get_quant(quant_type)
     gate_mode = GateMode(gate_mode)
+    is_ep = expert_mask is not None
+    if has_fake_expert_slot is None:
+        has_fake_expert_slot = is_ep
     token_num, _ = hidden_states.shape
     E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
     dtype = moe_out.dtype
@@ -3011,7 +3097,8 @@ def fused_moe_2stages(
         intermediate_pad,
         is_shuffled,
         gate_mode,
-        is_ep=expert_mask is not None,
+        is_ep=is_ep,
+        has_fake_expert_slot=has_fake_expert_slot,
         has_stage2_bias=bias2 is not None,
         opus_weights_shuffled=getattr(w1, "is_shuffled", False)
         and getattr(w2, "is_shuffled", False),
@@ -3043,7 +3130,20 @@ def fused_moe_2stages(
         and w1.dtype in (dtypes.fp4x2, dtypes.fp8)
     ):
         # mxfp8 activations + mxfp4 weights (a8w4) OR mxfp8 weights (a8w8).
-        if _MOE_A8W4_BYPASS_QUANT:
+        if (
+            hidden_states.dtype == dtypes.fp8
+            and a1_scale is not None
+            and a1_scale.dtype == dtypes.fp8_e8m0
+        ):
+            a1 = hidden_states
+            a1_scale = mxfp4_moe_sort_fwd(
+                a1_scale,
+                sorted_ids=sorted_ids,
+                num_valid_ids=num_valid_ids,
+                token_num=token_num,
+                cols=model_dim,
+            )
+        elif _MOE_A8W4_BYPASS_QUANT:
             # Debug bypass: skip real quant, feed unit scales.
             a1 = hidden_states.to(dtypes.fp8)
             M = sorted_ids.shape[0]

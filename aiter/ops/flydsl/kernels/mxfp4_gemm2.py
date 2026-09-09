@@ -379,7 +379,11 @@ def _gemm2_body(
 
     _asc_num = arith.index_cast(T.index, _raw(i32_max_m_blocks)) * fx.Index(_asc_per_mb)
     ascale_rsrc = _buffer_rsrc(arg_ascale, _asc_num)
-    bq_rsrc = _buffer_rsrc(arg_bq, fx.Index(_bq_bytes))
+    # Fold the expert offset into the 64-bit resource address; keep both buffer
+    # offsets and bounds expert-relative even when the allocation exceeds 4 GiB.
+    _bq_per_expert = _bq_bytes // NE
+    _bq_expert_base = arg_bq + fx.Int64(e) * fx.Int64(_bq_per_expert)
+    bq_rsrc = _buffer_rsrc(_bq_expert_base, fx.Index(_bq_per_expert))
     bscale_rsrc = _buffer_rsrc(arg_bscale, fx.Index(_bscale_bytes))
 
     # Sequential LDS layout: saq bytes at offset 0, f32 accumulator after them.
@@ -391,11 +395,9 @@ def _gemm2_body(
 
     b_load_s_base = []
     for j in range_constexpr(4):
+        # expert-relative: bq_rsrc is already re-based to this expert
         v = (
-            e * fx.Int32(N_OUT)
-            + n_block_idx * fx.Int32(BN)
-            + wave * fx.Int32(BN // 4)
-            + fx.Int32(j * 16)
+            n_block_idx * fx.Int32(BN) + wave * fx.Int32(BN // 4) + fx.Int32(j * 16)
         ) * fx.Int32(_K_HALF)
         b_load_s_base.append(rocdl.readfirstlane(T.i32, v))
 
